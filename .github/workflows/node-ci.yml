@@ -1,0 +1,164 @@
+name: Node CI
+
+# Installs dependencies with the detected package manager, then runs the named
+# package scripts in order. Optionally gates on `npm audit`.
+
+on:
+  workflow_call:
+    inputs:
+      node-version-file:
+        description: File holding the Node version, relative to working-directory.
+        required: false
+        type: string
+        default: .node-version
+      node-version:
+        description: Explicit Node version. Wins over node-version-file when set.
+        required: false
+        type: string
+        default: ''
+      package-manager:
+        description: >-
+          auto, npm or pnpm. auto picks pnpm when pnpm-lock.yaml sits in
+          working-directory, otherwise npm.
+        required: false
+        type: string
+        default: auto
+      working-directory:
+        description: Directory holding package.json.
+        required: false
+        type: string
+        default: .
+      scripts:
+        description: Package script names to run, one per line, in order.
+        required: false
+        type: string
+        default: test
+      audit:
+        description: Run `npm audit --omit=dev --audit-level=high` as a hard gate. npm only.
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  ci:
+    name: Node CI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: node-ci-${{ github.repository }}-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Detect package manager
+        id: pm
+        env:
+          REQUESTED: ${{ inputs.package-manager }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          VERSION_FILE: ${{ inputs.node-version-file }}
+          NODE_VERSION: ${{ inputs.node-version }}
+        run: |
+          set -euo pipefail
+
+          manager="$REQUESTED"
+          if [ "$manager" = auto ]; then
+            if [ -f pnpm-lock.yaml ]; then manager=pnpm; else manager=npm; fi
+          fi
+          case "$manager" in
+            npm|pnpm) ;;
+            *) echo "package-manager must be auto, npm or pnpm; got '${manager}'" >&2; exit 1 ;;
+          esac
+
+          # setup-node resolves its paths from the repository root, not from
+          # this step's working directory.
+          prefix="${WORKING_DIRECTORY#./}"
+          prefix="${prefix%/}"
+          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then prefix=""; else prefix="${prefix}/"; fi
+
+          if [ "$manager" = pnpm ]; then lockfile=pnpm-lock.yaml; else lockfile=package-lock.json; fi
+          cache=""
+          cache_path=""
+          if [ -f "$lockfile" ]; then
+            cache="$manager"
+            cache_path="${prefix}${lockfile}"
+          else
+            echo "No ${lockfile} in ${WORKING_DIRECTORY}; dependency caching is off."
+          fi
+
+          version_file=""
+          if [ -z "$NODE_VERSION" ]; then
+            if [ -f "$VERSION_FILE" ]; then
+              version_file="${prefix}${VERSION_FILE}"
+            else
+              echo "Neither node-version nor ${VERSION_FILE} is available." >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "manager=${manager}"
+            echo "cache=${cache}"
+            echo "cache_path=${cache_path}"
+            echo "version_file=${version_file}"
+            echo "package_json=${prefix}package.json"
+          } >> "$GITHUB_OUTPUT"
+          echo "Package manager: ${manager}"
+
+      - name: Set up pnpm
+        if: steps.pm.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: ${{ steps.pm.outputs.package_json }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ steps.pm.outputs.version_file }}
+          cache: ${{ steps.pm.outputs.cache }}
+          cache-dependency-path: ${{ steps.pm.outputs.cache_path }}
+
+      - name: Install dependencies
+        env:
+          MANAGER: ${{ steps.pm.outputs.manager }}
+        run: |
+          set -euo pipefail
+          if [ "$MANAGER" = pnpm ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Run scripts
+        env:
+          MANAGER: ${{ steps.pm.outputs.manager }}
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          set -euo pipefail
+          ran=0
+          while IFS= read -r script; do
+            script="${script%$'\r'}"
+            script="${script#"${script%%[![:space:]]*}"}"
+            script="${script%"${script##*[![:space:]]}"}"
+            [ -n "$script" ] || continue
+            ran=1
+            echo "::group::${MANAGER} run ${script}"
+            "$MANAGER" run "$script"
+            echo "::endgroup::"
+          done <<< "$SCRIPTS"
+          if [ "$ran" = 0 ]; then
+            echo "No scripts requested."
+          fi
+
+      - name: Audit dependencies
+        if: inputs.audit && steps.pm.outputs.manager == 'npm'
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Report skipped audit
+        if: inputs.audit && steps.pm.outputs.manager != 'npm'
+        run: echo "The audit gate is npm only. Skipped."

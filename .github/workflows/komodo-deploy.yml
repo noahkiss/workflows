@@ -1,0 +1,69 @@
+name: Komodo deploy
+
+# Posts a signed synthetic push event to a Komodo webhook listener so the
+# listener redeploys one stack. Callers gate the branch themselves, for example
+# `if: github.ref == 'refs/heads/main'` on the calling job.
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: Name of the Komodo stack to deploy.
+        required: true
+        type: string
+      listener_url:
+        description: >-
+          Base URL of the Komodo webhook listener, without a trailing slash,
+          for example https://hooks.example.com/listener/github
+        required: true
+        type: string
+      ref:
+        description: Git ref sent in the webhook payload.
+        required: false
+        type: string
+        default: refs/heads/main
+    secrets:
+      webhook_secret:
+        description: Shared secret the listener verifies. Must match KOMODO_WEBHOOK_SECRET.
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.stack }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Trigger stack deploy
+        env:
+          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
+          LISTENER_URL: ${{ inputs.listener_url }}
+          STACK: ${{ inputs.stack }}
+          PAYLOAD_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          payload="{\"ref\":\"${PAYLOAD_REF}\"}"
+          sig=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
+          url="${LISTENER_URL%/}/stack/${STACK}/deploy"
+
+          echo "POST ${url}"
+          status=$(curl --silent --show-error --location \
+            --output response.txt --write-out '%{http_code}' \
+            --max-time 60 \
+            --request POST "$url" \
+            --header 'Content-Type: application/json' \
+            --header 'X-GitHub-Event: push' \
+            --header "X-Hub-Signature-256: sha256=${sig}" \
+            --data "$payload")
+
+          echo "Listener responded with HTTP ${status}"
+          case "$status" in
+            2*)
+              echo "Deploy request accepted."
+              ;;
+            *)
+              echo "Deploy request failed." >&2
+              head -c 2000 response.txt >&2 || true
+              exit 1
+              ;;
+          esac

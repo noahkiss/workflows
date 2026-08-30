@@ -1,0 +1,167 @@
+name: Dispatch and wait
+
+# Starts a workflow_dispatch run in another repository and fails unless that
+# run concludes successfully.
+#
+# workflow_dispatch returns nothing that identifies the run it created, so this
+# workflow injects a request_id input and finds the run by matching that id in
+# the run's displayTitle. The target workflow must therefore accept a
+# `request_id` input and echo it in its `run-name:`.
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: Target repository as owner/name.
+        required: true
+        type: string
+      workflow:
+        description: Target workflow file name, for example release.yml.
+        required: true
+        type: string
+      inputs_json:
+        description: JSON object of inputs for the target workflow. request_id is added.
+        required: false
+        type: string
+        default: '{}'
+      timeout_minutes:
+        description: Deadline for finding the run and waiting for its conclusion.
+        required: false
+        type: number
+        default: 60
+      poll_seconds:
+        description: Seconds between polls.
+        required: false
+        type: number
+        default: 30
+    secrets:
+      token:
+        description: >-
+          Personal access token with `actions: write` on the target repository.
+          The caller's GITHUB_TOKEN cannot dispatch another repository.
+        required: true
+    outputs:
+      run_id:
+        description: Numeric id of the target run.
+        value: ${{ jobs.dispatch.outputs.run_id }}
+      run_url:
+        description: Web URL of the target run.
+        value: ${{ jobs.dispatch.outputs.run_url }}
+
+jobs:
+  dispatch:
+    name: Dispatch ${{ inputs.workflow }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      run_id: ${{ steps.find.outputs.run_id }}
+      run_url: ${{ steps.find.outputs.run_url }}
+    steps:
+      - name: Build the request
+        id: request
+        env:
+          INPUTS_JSON: ${{ inputs.inputs_json }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          request_id="${RUN_ID}-${RUN_ATTEMPT}-${RANDOM}${RANDOM}"
+          if ! payload=$(jq -ce --arg rid "$request_id" '. + {request_id: $rid}' <<< "$INPUTS_JSON"); then
+            echo "inputs_json must be a JSON object." >&2
+            exit 1
+          fi
+
+          echo "request_id=${request_id}" >> "$GITHUB_OUTPUT"
+          {
+            echo 'payload<<PAYLOAD_EOF'
+            printf '%s\n' "$payload"
+            echo 'PAYLOAD_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "Request id: ${request_id}"
+
+      - name: Dispatch the target workflow
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          TARGET_REPO: ${{ inputs.repo }}
+          TARGET_WORKFLOW: ${{ inputs.workflow }}
+          PAYLOAD: ${{ steps.request.outputs.payload }}
+        run: |
+          set -euo pipefail
+
+          attempt=1
+          delay=5
+          until printf '%s' "$PAYLOAD" \
+            | gh workflow run "$TARGET_WORKFLOW" --repo "$TARGET_REPO" --json; do
+            if [ "$attempt" -ge 6 ]; then
+              echo "Dispatch failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            echo "Dispatch attempt ${attempt} failed; retrying in ${delay}s."
+            sleep "$delay"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+          echo "Dispatch accepted."
+
+      - name: Wait for the target run
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          TARGET_REPO: ${{ inputs.repo }}
+          TARGET_WORKFLOW: ${{ inputs.workflow }}
+          REQUEST_ID: ${{ steps.request.outputs.request_id }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          POLL_SECONDS: ${{ inputs.poll_seconds }}
+        run: |
+          set -euo pipefail
+
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          run_id=""
+
+          # Phase one: the dispatch is queued but the run may not exist yet.
+          while [ -z "$run_id" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "No run titled with ${REQUEST_ID} appeared before the deadline." >&2
+              exit 1
+            fi
+            run_id=$(gh run list --repo "$TARGET_REPO" --workflow "$TARGET_WORKFLOW" \
+              --limit 100 --json databaseId,displayTitle \
+              | jq -r --arg rid "$REQUEST_ID" \
+                '[.[] | select(.displayTitle | contains($rid))] | first | .databaseId // empty')
+            if [ -z "$run_id" ]; then
+              echo "Waiting for the run to appear."
+              sleep "$POLL_SECONDS"
+            fi
+          done
+
+          run_url=$(gh run view "$run_id" --repo "$TARGET_REPO" --json url --jq '.url')
+          echo "Found run ${run_id}: ${run_url}"
+          {
+            echo "run_id=${run_id}"
+            echo "run_url=${run_url}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Phase two: wait for that run to conclude.
+          conclusion=""
+          while :; do
+            line=$(gh run view "$run_id" --repo "$TARGET_REPO" \
+              --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv')
+            status="${line%%$'\t'*}"
+            conclusion="${line#*$'\t'}"
+            if [ "$status" = completed ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Run ${run_id} was still ${status} at the deadline: ${run_url}" >&2
+              exit 1
+            fi
+            echo "Run ${run_id} is ${status}."
+            sleep "$POLL_SECONDS"
+          done
+
+          echo "Run ${run_id} concluded: ${conclusion}"
+          echo "[run ${run_id}](${run_url}) concluded: ${conclusion}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$conclusion" != success ]; then
+            exit 1
+          fi

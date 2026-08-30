@@ -1,0 +1,15 @@
+version: 2
+
+# This repository is the single place action versions are maintained. A bump
+# here reaches every caller that references these workflows at @main.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: actions
+    groups:
+      actions:
+        patterns:
+          - "*"

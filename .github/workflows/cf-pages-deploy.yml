@@ -1,0 +1,102 @@
+name: Cloudflare Pages deploy
+
+# Builds the site with npm, then publishes the output directory to a
+# Cloudflare Pages project with wrangler.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Cloudflare Pages project name.
+        required: true
+        type: string
+      directory:
+        description: Build output directory, relative to working-directory.
+        required: true
+        type: string
+      working-directory:
+        description: Directory holding package.json.
+        required: false
+        type: string
+        default: .
+      build-command:
+        description: Command that produces the output directory.
+        required: false
+        type: string
+        default: npm run build
+      node-version-file:
+        description: File holding the Node version, relative to working-directory.
+        required: false
+        type: string
+        default: .node-version
+    secrets:
+      cloudflare_api_token:
+        description: Cloudflare API token with the Pages edit permission.
+        required: true
+      cloudflare_account_id:
+        description: Cloudflare account id that owns the Pages project.
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.project }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: cf-pages-deploy-${{ github.repository }}-${{ inputs.project }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve paths
+        id: paths
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          VERSION_FILE: ${{ inputs.node-version-file }}
+        run: |
+          set -euo pipefail
+
+          # setup-node resolves its paths from the repository root, not from
+          # this step's working directory.
+          prefix="${WORKING_DIRECTORY#./}"
+          prefix="${prefix%/}"
+          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then prefix=""; else prefix="${prefix}/"; fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "${VERSION_FILE} not found in ${WORKING_DIRECTORY}." >&2
+            echo "Add the file, or point node-version-file at one that exists." >&2
+            exit 1
+          fi
+
+          {
+            echo "version_file=${prefix}${VERSION_FILE}"
+            echo "lock_path=${prefix}package-lock.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.paths.outputs.version_file }}
+          cache: npm
+          cache-dependency-path: ${{ steps.paths.outputs.lock_path }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.cloudflare_api_token }}
+          accountId: ${{ secrets.cloudflare_account_id }}
+          workingDirectory: ${{ inputs.working-directory }}
+          command: pages deploy ${{ inputs.directory }} --project-name=${{ inputs.project }}

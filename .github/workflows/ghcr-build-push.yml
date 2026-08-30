@@ -1,0 +1,170 @@
+name: GHCR build and push
+
+# Multi-architecture container build, pushed to GitHub Container Registry.
+# The calling job must grant `packages: write`; a called workflow cannot hold
+# more token permission than its caller.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: >-
+          Fully qualified image name. Empty means ghcr.io/<owner>/<repo>,
+          lowercased. Expressions are not allowed in workflow_call defaults, so
+          the fallback is computed in a step.
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: Comma-separated buildx platform list for the pushed image.
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      tags:
+        description: Tag rules for docker/metadata-action, one per line.
+        required: false
+        type: string
+        default: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+      checkout_ref:
+        description: >-
+          Ref or SHA to check out. Empty checks out the ref that triggered the
+          run. Set it to github.event.workflow_run.head_sha for workflow_run
+          callers, which otherwise check out the default branch.
+        required: false
+        type: string
+        default: ''
+      context:
+        description: Build context path.
+        required: false
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path. Empty uses the buildx default.
+        required: false
+        type: string
+        default: ''
+      smoke_command:
+        description: >-
+          Shell command run against a single-arch build before the push. The
+          image reference is in the IMAGE environment variable. Empty skips it.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      digest:
+        description: Digest of the pushed image.
+        value: ${{ jobs.build.outputs.digest }}
+      tags:
+        description: Tags docker/metadata-action produced, one per line.
+        value: ${{ jobs.build.outputs.tags }}
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # The guard lives at job level: a called workflow's jobs belong to the
+    # caller's run, so a workflow-level guard here has no run to scope to. The
+    # literal prefix keeps this group distinct from any caller's group.
+    concurrency:
+      group: ghcr-build-push-${{ github.repository }}-${{ inputs.image }}-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Resolve image name
+        id: image
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_INPUT}"
+          if [ -z "$image" ]; then
+            image="ghcr.io/${REPOSITORY}"
+          fi
+          image=$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')
+          echo "name=${image}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${image}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: ${{ inputs.tags }}
+
+      - name: Build amd64 image for the smoke test
+        if: inputs.smoke_command != ''
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.name }}:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the smoke test
+        if: inputs.smoke_command != ''
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:smoke
+          SMOKE_COMMAND: ${{ inputs.smoke_command }}
+        run: bash -euo pipefail -c "$SMOKE_COMMAND"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Pushed image"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo '```'
+            printf '%s\n' "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
