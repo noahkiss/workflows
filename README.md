@@ -71,6 +71,11 @@ It signs the payload with HMAC-SHA256 and sends the hex digest in
 `X-Hub-Signature-256`. A non-2xx reply fails the job. The secret and the
 signature are never printed.
 
+The post is attempted twice, 75 seconds apart, but only when the first failure
+is one a fresh runner can clear — a transport error, a 429, a 5xx, or a 403
+carrying an HTML error page from a CDN or WAF. A 401 or any other 4xx is a real
+rejection and fails at once.
+
 **Gate the branch yourself.** This workflow does not check which branch you are
 on.
 

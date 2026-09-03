@@ -46,24 +46,62 @@ jobs:
           sig=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
           url="${LISTENER_URL%/}/stack/${STACK}/deploy"
 
-          echo "POST ${url}"
-          status=$(curl --silent --show-error --location \
-            --output response.txt --write-out '%{http_code}' \
-            --max-time 60 \
-            --request POST "$url" \
-            --header 'Content-Type: application/json' \
-            --header 'X-GitHub-Event: push' \
-            --header "X-Hub-Signature-256: sha256=${sig}" \
-            --data "$payload")
+          # A CDN or WAF in front of the listener can reject the runner itself,
+          # before the request ever reaches the listener. Each attempt gets a
+          # different runner with a different source address, so one retry
+          # usually clears it. Retry only what a second attempt can fix: a
+          # transport error, a 429, a 5xx, or a 403 that carries an HTML error
+          # page rather than the listener's own reply. Every other 4xx, a 401
+          # above all, is a real answer and must not be repeated.
+          max_attempts=2
+          backoff=75
 
-          echo "Listener responded with HTTP ${status}"
-          case "$status" in
-            2*)
+          echo "POST ${url}"
+          attempt=1
+          while true; do
+            rc=0
+            status=$(curl --silent --show-error --location \
+              --output response.txt --write-out '%{http_code}' \
+              --max-time 60 \
+              --request POST "$url" \
+              --header 'Content-Type: application/json' \
+              --header 'X-GitHub-Event: push' \
+              --header "X-Hub-Signature-256: sha256=${sig}" \
+              --data "$payload") || rc=$?
+
+            if [ "$rc" -ne 0 ]; then
+              status=000
+              echo "Attempt ${attempt}: curl exited ${rc} with no response."
+            else
+              echo "Attempt ${attempt}: listener responded with HTTP ${status}"
+            fi
+
+            if [ "${status#2}" != "$status" ]; then
               echo "Deploy request accepted."
-              ;;
-            *)
-              echo "Deploy request failed." >&2
-              head -c 2000 response.txt >&2 || true
-              exit 1
-              ;;
-          esac
+              exit 0
+            fi
+
+            retryable=no
+            case "$status" in
+              000|429|5??) retryable=yes ;;
+              403)
+                # The listener answers in JSON or plain text. An HTML body on a
+                # 403 means something upstream blocked us, not the listener.
+                if grep -qiE '<!doctype html|<html' response.txt; then
+                  retryable=yes
+                fi
+                ;;
+            esac
+
+            if [ "$retryable" = no ] || [ "$attempt" -ge "$max_attempts" ]; then
+              break
+            fi
+
+            echo "Retrying once in ${backoff}s on a fresh runner."
+            sleep "$backoff"
+            attempt=$((attempt + 1))
+          done
+
+          echo "Deploy request failed." >&2
+          head -c 2000 response.txt >&2 || true
+          exit 1
