@@ -118,6 +118,7 @@ Replaces the near-identical multi-architecture GHCR build in ten repositories.
 | `image` | no | `''` → `ghcr.io/<owner>/<repo>`, lowercased | Image name |
 | `platforms` | no | `linux/amd64,linux/arm64` | Platforms for the pushed image |
 | `tags` | no | see below | Rules for `docker/metadata-action`, one per line |
+| `labels` | no | `''` | Extra `key=value` labels, one per line; each replaces the generated label of the same key |
 | `checkout_ref` | no | `''` → the triggering ref | Ref or SHA to check out |
 | `context` | no | `.` | Build context |
 | `dockerfile` | no | `''` → buildx default | Dockerfile path |
@@ -200,6 +201,23 @@ jobs:
     with:
       checkout_ref: ${{ github.event.workflow_run.head_sha }}
 ```
+
+`checkout_ref` alone is not enough. `docker/metadata-action` derives
+`org.opencontainers.image.revision` from `github.sha`, which on a `workflow_run`
+event is the default branch head, not the commit you just built. The two
+diverge whenever another commit lands mid-build, and the image then claims a
+revision it does not contain. Set the label too:
+
+```yaml
+    with:
+      checkout_ref: ${{ github.event.workflow_run.head_sha }}
+      labels: |
+        org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+```
+
+A `labels` entry replaces the generated label of the same key, so the last
+value wins. Note that `annotations` still come from `github.sha`; only the
+image config labels are corrected here.
 
 ---
 

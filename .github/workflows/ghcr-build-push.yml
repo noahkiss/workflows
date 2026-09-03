@@ -29,6 +29,16 @@ on:
           type=semver,pattern={{version}}
           type=sha,prefix=sha-
           type=raw,value=latest,enable={{is_default_branch}}
+      labels:
+        description: >-
+          Extra labels for docker/metadata-action, one key=value per line. An
+          entry replaces the generated label of the same key. Set
+          org.opencontainers.image.revision when the build does not come from
+          github.sha, as with a workflow_run caller that checks out
+          head_sha.
+        required: false
+        type: string
+        default: ''
       checkout_ref:
         description: >-
           Ref or SHA to check out. Empty checks out the ref that triggered the
@@ -118,6 +128,7 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: ${{ inputs.tags }}
+          labels: ${{ inputs.labels }}
 
       - name: Build amd64 image for the smoke test
         if: inputs.smoke_command != ''
