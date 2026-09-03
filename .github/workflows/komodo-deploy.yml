@@ -47,10 +47,11 @@ jobs:
           url="${LISTENER_URL%/}/stack/${STACK}/deploy"
 
           # A CDN or WAF in front of the listener can reject the runner itself,
-          # before the request ever reaches the listener. Each attempt gets a
-          # different runner with a different source address, so one retry
-          # usually clears it. Retry only what a second attempt can fix: a
-          # transport error, a 429, a 5xx, or a 403 that carries an HTML error
+          # before the request ever reaches the listener. A retry runs on the
+          # same runner, so it clears transient edge state but not a block tied
+          # to the runner's location; fix those at the edge, not here. Retry
+          # only what a second attempt can plausibly fix: a transport error,
+          # a 429, a 5xx, or a 403 that carries an HTML error
           # page rather than the listener's own reply. Every other 4xx, a 401
           # above all, is a real answer and must not be repeated.
           max_attempts=2
