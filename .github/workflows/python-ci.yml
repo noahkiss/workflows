@@ -46,7 +46,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Resolve Python version
         id: py
@@ -79,7 +79,7 @@ jobs:
       # No floating major tag is published past v7, so this is pinned exactly.
       # Dependabot raises the bump.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: ${{ steps.py.outputs.version }}
           working-directory: ${{ github.workspace }}/${{ inputs.working-directory }}

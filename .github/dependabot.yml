@@ -2,6 +2,12 @@ version: 2
 
 # This repository is the single place action versions are maintained. A bump
 # here reaches every caller that references these workflows at @main.
+#
+# Every action is pinned to a full commit SHA with the version in a trailing
+# comment. Dependabot handles that format natively — it rewrites the SHA and
+# the comment together — so no extra configuration is needed here. Keep the
+# comment when reviewing a bump: it is what makes the hash diff readable, and
+# this repository's review is the only one those bumps get.
 updates:
   - package-ecosystem: github-actions
     directory: /

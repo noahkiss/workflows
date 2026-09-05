@@ -8,10 +8,27 @@ Call one by reference:
 uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 ```
 
-Every workflow runs on `ubuntu-latest`. Action versions are pinned to major tags
-and Dependabot raises the bumps here weekly, so one merge in this repository
-updates every caller. `astral-sh/setup-uv` is the one exception: it publishes no
-floating major tag past `v7`, so `python-ci.yml` pins it to an exact version.
+Every workflow runs on `ubuntu-latest`.
+
+**Every action is pinned to a full commit SHA**, with the version it resolved to
+in a trailing comment:
+
+```yaml
+uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+A major tag is a moving pointer. Callers reference these workflows at `@main`, so
+a tag repointed upstream reaches every repository on the next run, and nothing in
+the caller records which code executed. A SHA is the only reference that answers
+"what ran" after the fact. This repository is the one place that matters, because
+it is the only place an action version is written.
+
+The trailing comment is not decoration. A bare hash makes the bump diff
+unreadable, and this repository's review is the only review those bumps get.
+Keep the comment in step with the SHA.
+
+Dependabot raises the bumps here weekly and understands this format natively: it
+rewrites both the SHA and the comment. One merge here updates every caller.
 
 ## Rules that apply to all of them
 
@@ -254,7 +271,7 @@ permissions:
 npm. Install is `pnpm install --frozen-lockfile` or `npm ci`. `setup-node`
 caches for the detected manager, and only when the matching lockfile exists.
 
-pnpm comes from `pnpm/action-setup@v6`, which reads the version from the
+pnpm comes from `pnpm/action-setup` (pinned, v6.0.10), which reads the version from the
 `packageManager` field of your `package.json`. Set that field in any pnpm repo.
 
 `audit` is npm only. It is skipped, with a note in the log, when the manager is
