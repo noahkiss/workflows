@@ -10,7 +10,8 @@ uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 
 Every workflow runs on `ubuntu-latest`. Action versions are pinned to major tags
 and Dependabot raises the bumps here weekly, so one merge in this repository
-updates every caller.
+updates every caller. `astral-sh/setup-uv` is the one exception: it publishes no
+floating major tag past `v7`, so `python-ci.yml` pins it to an exact version.
 
 ## Rules that apply to all of them
 
@@ -30,8 +31,8 @@ caller is invisible here. Pass values as inputs.
 A called workflow's jobs run inside the *caller's* workflow run, so there is no
 separate run for a workflow-level `concurrency:` block here to scope to. GitHub's
 own reusable-workflow reference discusses the guard only in its
-`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci` and
-`cf-pages-deploy` each carry a job-level guard.
+`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`
+and `cf-pages-deploy` each carry a job-level guard.
 
 Each group name starts with a literal unique to its file. That is deliberate.
 The docs warn:
@@ -273,6 +274,59 @@ jobs:
         typecheck
         test
       audit: true
+```
+
+---
+
+## `python-ci.yml`
+
+The shared Python test gate. It installs the locked dependency set with uv, then
+runs the given commands in order under `uv run`.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `python-version-file` | no | `.python-version` | Version file, relative to `working-directory` |
+| `python-version` | no | `''` | Explicit version; wins over the file |
+| `working-directory` | no | `.` | Directory holding `pyproject.toml` |
+| `install` | no | `uv sync --frozen` | Install command; empty skips the step |
+| `commands` | no | `pytest` | Commands run under `uv run`, one per line, in order |
+
+Secrets: none.
+
+Permissions the calling job must grant:
+
+```yaml
+permissions:
+  contents: read
+```
+
+`--frozen` is what makes the committed `uv.lock` authoritative: it installs the
+locked set and fails if the lockfile is stale, rather than quietly re-resolving.
+
+The workflow takes commands, not a runner name. Repositories here use both
+pytest and unittest, and one gate that forced a single runner would mean
+rewriting working suites for no gain.
+
+Each command is run through the shell, so flags and quoting work as written:
+`pytest -m 'not integration'` does what it looks like.
+
+`setup-uv` has no version-file input of its own, so the workflow reads the file
+and passes the value as `python-version`. A version file under a non-default name
+therefore works, which uv's own discovery would not do.
+
+The job fails early if neither `python-version` nor the version file is
+available.
+
+```yaml
+jobs:
+  ci:
+    uses: noahkiss/workflows/.github/workflows/python-ci.yml@main
+    permissions:
+      contents: read
+    with:
+      commands: |
+        ruff check .
+        pytest
 ```
 
 ---

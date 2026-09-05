@@ -1,0 +1,120 @@
+name: Python CI
+
+# Installs the locked dependency set with uv, then runs the given commands in
+# order under `uv run`.
+
+on:
+  workflow_call:
+    inputs:
+      python-version-file:
+        description: File holding the Python version, relative to working-directory.
+        required: false
+        type: string
+        default: .python-version
+      python-version:
+        description: Explicit Python version. Wins over python-version-file when set.
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: Directory holding pyproject.toml.
+        required: false
+        type: string
+        default: .
+      install:
+        description: Command that installs the dependency set. Empty skips the step.
+        required: false
+        type: string
+        default: uv sync --frozen
+      commands:
+        description: Commands to run under `uv run`, one per line, in order.
+        required: false
+        type: string
+        default: pytest
+
+jobs:
+  ci:
+    name: Python CI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: python-ci-${{ github.repository }}-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve Python version
+        id: py
+        env:
+          VERSION_FILE: ${{ inputs.python-version-file }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          set -euo pipefail
+
+          # setup-uv has no version-file input, so the file is read here and
+          # handed over as python-version. That also makes a version file under
+          # a non-default name work, which uv's own discovery would not.
+          version="$PYTHON_VERSION"
+          if [ -z "$version" ]; then
+            if [ -f "$VERSION_FILE" ]; then
+              version="$(tr -d '[:space:]' < "$VERSION_FILE")"
+            else
+              echo "Neither python-version nor ${VERSION_FILE} is available." >&2
+              exit 1
+            fi
+            if [ -z "$version" ]; then
+              echo "${VERSION_FILE} is empty." >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Python version: ${version}"
+
+      # No floating major tag is published past v7, so this is pinned exactly.
+      # Dependabot raises the bump.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ steps.py.outputs.version }}
+          working-directory: ${{ github.workspace }}/${{ inputs.working-directory }}
+          enable-cache: true
+          ignore-nothing-to-cache: true
+
+      - name: Install dependencies
+        env:
+          INSTALL: ${{ inputs.install }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INSTALL//[[:space:]]/}" ]; then
+            echo "No install command requested."
+            exit 0
+          fi
+          echo "::group::${INSTALL}"
+          eval "$INSTALL"
+          echo "::endgroup::"
+
+      - name: Run commands
+        env:
+          COMMANDS: ${{ inputs.commands }}
+        run: |
+          set -euo pipefail
+          ran=0
+          while IFS= read -r command; do
+            command="${command%$'\r'}"
+            command="${command#"${command%%[![:space:]]*}"}"
+            command="${command%"${command##*[![:space:]]}"}"
+            [ -n "$command" ] || continue
+            ran=1
+            echo "::group::uv run ${command}"
+            eval "uv run ${command}"
+            echo "::endgroup::"
+          done <<< "$COMMANDS"
+          if [ "$ran" = 0 ]; then
+            echo "No commands requested."
+          fi
