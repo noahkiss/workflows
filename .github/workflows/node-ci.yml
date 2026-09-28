@@ -34,7 +34,9 @@ on:
         type: string
         default: test
       audit:
-        description: Run `npm audit --omit=dev --audit-level=high` as a hard gate. npm only.
+        description: >-
+          Run `npm audit --omit=dev --audit-level=high` as a hard gate. npm only.
+          An unreachable audit endpoint is retried, then passes with a warning.
         required: false
         type: boolean
         default: false
@@ -155,9 +157,43 @@ jobs:
             echo "No scripts requested."
           fi
 
+      # npm exits 1 both for advisories at or above the level and for an audit
+      # endpoint it could not reach (a registry 503, a reset connection). Only
+      # the first says anything about the code. npm marks the second with the
+      # literal line "audit endpoint returned an error" (lib/utils/audit-error.js
+      # in the npm CLI); it never prints that line for a finding. So: retry on
+      # the marker with backoff, pass with a warning if the endpoint stays down,
+      # and fail on every other non-zero exit.
       - name: Audit dependencies
         if: inputs.audit && steps.pm.outputs.manager == 'npm'
-        run: npm audit --omit=dev --audit-level=high
+        env:
+          AUDIT_ATTEMPTS: '3'
+          AUDIT_BACKOFF_SECONDS: '20'
+        run: |
+          # The runner starts bash with -e; the loop reads exit codes itself.
+          set +e -uo pipefail
+          marker='audit endpoint returned an error'
+          log="$(mktemp)"
+          attempt=1
+          while :; do
+            npm audit --omit=dev --audit-level=high 2>&1 | tee "$log"
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if ! grep -qF "$marker" "$log"; then
+              echo "::error title=npm audit::Advisories at or above high, or npm failed for another reason (exit ${status})."
+              exit "$status"
+            fi
+            if [ "$attempt" -ge "$AUDIT_ATTEMPTS" ]; then
+              echo "::warning title=npm audit skipped::The audit endpoint returned an error on all ${AUDIT_ATTEMPTS} attempts. No advisories were checked for this run."
+              exit 0
+            fi
+            wait_for=$(( AUDIT_BACKOFF_SECONDS * attempt ))
+            echo "Audit endpoint error on attempt ${attempt} of ${AUDIT_ATTEMPTS}. Retrying in ${wait_for}s."
+            sleep "$wait_for"
+            attempt=$(( attempt + 1 ))
+          done
 
       - name: Report skipped audit
         if: inputs.audit && steps.pm.outputs.manager != 'npm'
