@@ -134,12 +134,14 @@ jobs:
 
 ## `ghcr-build-push.yml`
 
-Replaces the near-identical multi-architecture GHCR build in ten repositories.
+Replaces the near-identical GHCR build in ten repositories. It builds
+`linux/amd64` only by default; a caller whose image runs on an ARM host passes
+`platforms: linux/amd64,linux/arm64`.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
 | `image` | no | `''` → `ghcr.io/<owner>/<repo>`, lowercased | Image name |
-| `platforms` | no | `linux/amd64,linux/arm64` | Platforms for the pushed image |
+| `platforms` | no | `linux/amd64` | Platforms for the pushed image |
 | `tags` | no | see below | Rules for `docker/metadata-action`, one per line |
 | `labels` | no | `''` | Extra `key=value` labels, one per line; each replaces the generated label of the same key |
 | `checkout_ref` | no | `''` → the triggering ref | Ref or SHA to check out |
@@ -192,7 +194,7 @@ jobs:
 
 Set it and the build runs twice. First an amd64-only build with `load: true`,
 tagged locally; your command runs against it with the image reference in
-`IMAGE`. Only then does the multi-platform build and push happen. The second
+`IMAGE`. Only then does the build for `platforms` run and push. The second
 build reuses the same `gha` cache, so it is cheap.
 
 Use it to prove the image actually works before it reaches the registry — for

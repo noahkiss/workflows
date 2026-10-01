@@ -1,6 +1,7 @@
 name: GHCR build and push
 
-# Multi-architecture container build, pushed to GitHub Container Registry.
+# Container build, pushed to GitHub Container Registry. Builds linux/amd64 by
+# default; pass `platforms` to add linux/arm64 when an ARM host runs the image.
 # The calling job must grant `packages: write`; a called workflow cannot hold
 # more token permission than its caller.
 
@@ -16,10 +17,12 @@ on:
         type: string
         default: ''
       platforms:
-        description: Comma-separated buildx platform list for the pushed image.
+        description: >-
+          Comma-separated buildx platform list for the pushed image. Add
+          linux/arm64 only when an ARM host will run the image.
         required: false
         type: string
-        default: linux/amd64,linux/arm64
+        default: linux/amd64
       tags:
         description: Tag rules for docker/metadata-action, one per line.
         required: false
