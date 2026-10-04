@@ -147,6 +147,7 @@ Replaces the near-identical GHCR build in ten repositories. It builds
 | `checkout_ref` | no | `''` → the triggering ref | Ref or SHA to check out |
 | `context` | no | `.` | Build context |
 | `dockerfile` | no | `''` → buildx default | Dockerfile path |
+| `build_args` | no | `''` | Build arguments for both builds, one `KEY=value` per line |
 | `smoke_command` | no | `''` → skipped | Command run against a pre-push build |
 
 Default `tags`:

@@ -60,6 +60,13 @@ on:
         required: false
         type: string
         default: ''
+      build_args:
+        description: >-
+          Build arguments for both builds, one KEY=value per line. Empty
+          passes none.
+        required: false
+        type: string
+        default: ''
       smoke_command:
         description: >-
           Shell command run against a single-arch build before the push. The
@@ -141,6 +148,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: linux/amd64
           load: true
+          build-args: ${{ inputs.build_args }}
           push: false
           tags: ${{ steps.image.outputs.name }}:smoke
           cache-from: type=gha
@@ -161,6 +169,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
           push: true
+          build-args: ${{ inputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
