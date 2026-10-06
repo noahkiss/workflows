@@ -1,0 +1,77 @@
+name: macOS sign and notarize
+description: >-
+  Sign a .app bundle or a bare Mach-O binary with a Developer ID identity
+  (hardened runtime, secure timestamp, optional entitlements), notarize it with
+  an App Store Connect API key, staple a bundle, and verify the result. The
+  certificate goes into a throwaway keychain that is deleted afterwards.
+
+inputs:
+  path:
+    description: The .app bundle or Mach-O binary to sign, relative to the workspace or absolute.
+    required: true
+  identity:
+    description: Full signing identity, e.g. "Developer ID Application: Example Inc. (ABCDE12345)".
+    required: true
+  team-id:
+    description: Team ID the signature must carry. The step fails on any other.
+    required: true
+  entitlements:
+    description: Entitlements plist applied to every executable. Empty for none.
+    required: false
+    default: ''
+  identifier:
+    description: Code identifier for a bare binary. A bundle uses its CFBundleIdentifier.
+    required: false
+    default: ''
+  notarize:
+    description: Submit to Apple's notary service and wait for the verdict.
+    required: false
+    default: 'true'
+  certificate-p12:
+    description: Base64 of the .p12 that holds the certificate and its private key.
+    required: true
+  certificate-password:
+    description: Password of the .p12.
+    required: true
+  notary-key-p8:
+    description: App Store Connect API private key (.p8 PEM text). Required when notarize is true.
+    required: false
+    default: ''
+  notary-key-id:
+    description: The API key's ID.
+    required: false
+    default: ''
+  notary-issuer-id:
+    description: The API key's issuer ID.
+    required: false
+    default: ''
+
+outputs:
+  submission-id:
+    description: Notary submission ID, empty when notarize is false.
+    value: ${{ steps.sign.outputs.submission-id }}
+  status:
+    description: Notary verdict, e.g. Accepted.
+    value: ${{ steps.sign.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Sign, notarize and verify
+      id: sign
+      shell: bash
+      env:
+        SIGN_PATH: ${{ inputs.path }}
+        SIGN_IDENTITY: ${{ inputs.identity }}
+        SIGN_TEAM_ID: ${{ inputs.team-id }}
+        SIGN_ENTITLEMENTS: ${{ inputs.entitlements }}
+        SIGN_IDENTIFIER: ${{ inputs.identifier }}
+        SIGN_NOTARIZE: ${{ inputs.notarize }}
+        MAC_CERT_P12: ${{ inputs.certificate-p12 }}
+        MAC_CERT_PASSWORD: ${{ inputs.certificate-password }}
+        ASC_KEY_P8: ${{ inputs.notary-key-p8 }}
+        ASC_KEY_ID: ${{ inputs.notary-key-id }}
+        ASC_ISSUER_ID: ${{ inputs.notary-issuer-id }}
+      run: |
+        [ "$RUNNER_OS" = macOS ] || { echo "::error::macos-sign-notarize needs a macOS runner"; exit 1; }
+        "$GITHUB_ACTION_PATH/sign-notarize.sh"

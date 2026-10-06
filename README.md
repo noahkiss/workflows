@@ -8,7 +8,15 @@ Call one by reference:
 uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 ```
 
-Every workflow runs on `ubuntu-latest`.
+Every workflow runs on `ubuntu-latest`, except `tauri-macos-release.yml`, which
+needs macOS. macOS minutes are free for public repositories and metered at 10x
+for private ones.
+
+Composite actions live under `actions/`. Call one from a step:
+
+```yaml
+uses: noahkiss/workflows/actions/<name>@main
+```
 
 **Every action is pinned to a full commit SHA**, with the version it resolved to
 in a trailing comment:
@@ -457,3 +465,174 @@ jobs:
       cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+---
+
+## `tauri-macos-release.yml`
+
+The release pipeline for a Tauri app on macOS. From a release tag it builds the
+app for Apple Silicon, signs it with a Developer ID identity, notarizes and
+staples it, zips it with `ditto`, attaches the zip to the tag's GitHub Release,
+and can then bump a Homebrew cask through `dispatch-and-wait.yml`.
+
+Steps: resolve the tag, check out the tag, check that `Cargo.toml` and
+`tauri.conf.json` state the tag's version, install Rust (and any Homebrew
+packages), `rust-cache`, pnpm and Node, `pnpm install --frozen-lockfile`,
+`tauri build --bundles app`, check the bundle's `CFBundleShortVersionString`,
+`macos-sign-notarize`, the smoke command, zip, wait for a green CI run on the
+tagged commit, attach.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `tag` | no | `''` → the triggering tag | Release tag, `vX.Y.Z` |
+| `app-name` | yes | — | Bundle name without `.app` (`productName`) |
+| `asset-prefix` | yes | — | The zip is `<asset-prefix>-<version>-arm64.zip` |
+| `tauri-dir` | no | `src-tauri` | Folder with `tauri.conf.json` and `Cargo.toml` |
+| `bundle-path` | no | `''` → `<tauri-dir>/target/release/bundle/macos/<app-name>.app` | Built bundle |
+| `frontend-dir` | no | `app` | Folder with the frontend's `package.json` (pnpm); empty skips Node |
+| `node-version-file` | no | `.node-version` | Node version file |
+| `tauri-command` | no | `''` → `<frontend-dir>/node_modules/.bin/tauri` | Tauri CLI command |
+| `brew-packages` | no | `''` | Homebrew packages, space-separated |
+| `check-versions` | no | `true` | Manifest versions must match the tag |
+| `smoke-command` | no | `''` | Run against the signed bundle; `$APP` holds its path |
+| `entitlements` | no | `''` | Entitlements plist |
+| `signing-identity` | no | `''` → no Developer ID signature | Full identity string |
+| `team-id` | no | `''` | Team ID the signature must carry |
+| `notarize` | no | `true` | Notarize and staple |
+| `environment` | no | `release` | Environment holding the signing secrets |
+| `require-ci-workflow` | no | `''` → skipped | Workflow file that must be green on the tagged commit |
+| `ci-timeout-minutes` | no | `40` | How long to wait for it |
+| `tap-repo` | no | `''` → no bump | Homebrew tap, `owner/name` |
+| `tap-formula` | no | `''` | Formula or cask name for the tap's bump |
+| `tap-workflow` | no | `bump.yml` | The tap's bump workflow |
+| `runner` | no | `macos-26` | macOS runner label |
+
+| Secret | Required | Meaning |
+|---|---|---|
+| `MAC_CERT_P12` | to sign | Base64 `.p12` (certificate and private key) |
+| `MAC_CERT_PASSWORD` | to sign | Its password |
+| `ASC_KEY_P8` | to notarize | App Store Connect API key, `.p8` PEM text |
+| `ASC_KEY_ID` | to notarize | Its key ID |
+| `ASC_ISSUER_ID` | to notarize | Its issuer ID |
+| `tap_token` | with `tap-repo` | PAT with `actions: write` on the tap |
+
+| Output | Meaning |
+|---|---|
+| `tag` | The release tag |
+| `asset` | File name of the attached zip |
+
+Permissions the calling job must grant:
+
+```yaml
+permissions:
+  contents: write
+  actions: read
+```
+
+**Signing secrets live in an environment, not in the caller.** Put the five
+signing secrets in a GitHub environment (default name `release`) limited to
+`v*` tags. The build job names that environment, so it reads them directly and
+the caller does not pass them. A branch push or a pull request cannot reach
+them. Because of that limit, re-run a release by dispatching the caller **on the
+tag**: `gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`.
+
+**Never clobber.** If the tag's release already has the zip, the job keeps it
+and succeeds. A cask pins the sha256 of what was published first, and a rebuilt
+zip is not byte-identical.
+
+The tap's bump workflow must follow `dispatch-and-wait.yml`'s target-side
+contract and take `{"formula": ..., "tag": ...}`.
+
+```yaml
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release
+        required: true
+
+jobs:
+  release:
+    uses: noahkiss/workflows/.github/workflows/tauri-macos-release.yml@main
+    permissions:
+      contents: write
+      actions: read
+    with:
+      tag: ${{ inputs.tag }}
+      app-name: MyApp
+      asset-prefix: myapp
+      entitlements: src-tauri/Entitlements.plist
+      signing-identity: 'Developer ID Application: Example Inc. (ABCDE12345)'
+      team-id: ABCDE12345
+      require-ci-workflow: ci.yml
+      tap-repo: example/homebrew-tap
+      tap-formula: myapp
+    secrets:
+      tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+```
+
+---
+
+## `actions/macos-sign-notarize`
+
+A composite action, usable on its own in any macOS job. It signs a `.app`
+bundle or a bare Mach-O binary with a Developer ID identity, notarizes it, and
+verifies the result. `tauri-macos-release.yml` uses it.
+
+1. Imports the `.p12` into a throwaway keychain.
+2. Signs with `--options runtime --timestamp`. A bundle is signed inside out:
+   loose Mach-O files, then nested `.framework`, `.app`, `.xpc` and `.appex`
+   bundles, deepest first, then the bundle. Executables and nested apps get the
+   entitlements; libraries and frameworks do not.
+3. Checks `codesign --verify --deep --strict`, the team ID, the hardened-runtime
+   flag and the timestamp.
+4. Zips with `ditto` and runs `notarytool submit --wait`. A rejection prints the
+   notary log and fails.
+5. A bundle: `stapler staple`, `stapler validate`, `spctl --assess --type execute`.
+   A bare binary cannot hold a ticket; Gatekeeper fetches it online.
+6. Both: `codesign --verify -R=notarized --check-notarization`.
+7. Deletes the keychain and the key file, and restores the keychain search list.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `path` | yes | — | `.app` bundle or Mach-O binary |
+| `identity` | yes | — | Full signing identity |
+| `team-id` | yes | — | Team ID the signature must carry |
+| `entitlements` | no | `''` | Entitlements plist |
+| `identifier` | no | `''` | Code identifier for a bare binary |
+| `notarize` | no | `true` | Submit and wait |
+| `certificate-p12` | yes | — | Base64 `.p12` |
+| `certificate-password` | yes | — | Its password |
+| `notary-key-p8` | to notarize | `''` | App Store Connect API key, `.p8` PEM text |
+| `notary-key-id` | to notarize | `''` | Its key ID |
+| `notary-issuer-id` | to notarize | `''` | Its issuer ID |
+
+| Output | Meaning |
+|---|---|
+| `submission-id` | Notary submission ID |
+| `status` | Notary verdict, e.g. `Accepted` |
+
+No secret is printed. Use the Developer-role API key for notarization, never
+an Admin key.
+
+```yaml
+      - uses: noahkiss/workflows/actions/macos-sign-notarize@main
+        with:
+          path: target/release/mytool
+          identity: 'Developer ID Application: Example Inc. (ABCDE12345)'
+          team-id: ABCDE12345
+          identifier: com.example.mytool
+          certificate-p12: ${{ secrets.MAC_CERT_P12 }}
+          certificate-password: ${{ secrets.MAC_CERT_PASSWORD }}
+          notary-key-p8: ${{ secrets.ASC_KEY_P8 }}
+          notary-key-id: ${{ secrets.ASC_KEY_ID }}
+          notary-issuer-id: ${{ secrets.ASC_ISSUER_ID }}
+```
+
+`sign-notarize.sh` runs on a Mac by hand, with the same values as environment
+variables (`SIGN_PATH`, `SIGN_IDENTITY`, `SIGN_TEAM_ID`, `SIGN_ENTITLEMENTS`,
+`SIGN_IDENTIFIER`, `SIGN_NOTARIZE`, `ASC_KEY_P8`, `ASC_KEY_ID`,
+`ASC_ISSUER_ID`). Leave `MAC_CERT_P12` unset and it signs with the identity in
+the login keychain.
