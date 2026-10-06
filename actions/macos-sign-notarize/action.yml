@@ -10,7 +10,7 @@ inputs:
     description: The .app bundle or Mach-O binary to sign, relative to the workspace or absolute.
     required: true
   identity:
-    description: Full signing identity, e.g. "Developer ID Application: Example Inc. (ABCDE12345)".
+    description: 'Full signing identity, e.g. "Developer ID Application: Example Inc. (ABCDE12345)".'
     required: true
   team-id:
     description: Team ID the signature must carry. The step fails on any other.
