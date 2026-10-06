@@ -8,9 +8,10 @@ Call one by reference:
 uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 ```
 
-Every workflow runs on `ubuntu-latest`, except `tauri-macos-release.yml`, which
-needs macOS. macOS minutes are free for public repositories and metered at 10x
-for private ones.
+Every workflow runs on `ubuntu-latest`. The macOS composite actions
+(`tauri-macos-build`, `macos-sign-notarize`, `release-attach`) need a macOS
+runner. macOS minutes are free for public repositories and metered at 10x for
+private ones.
 
 Composite actions live under `actions/`. Call one from a step:
 
@@ -468,19 +469,38 @@ jobs:
 
 ---
 
-## `tauri-macos-release.yml`
+## Tauri macOS release: `actions/tauri-macos-build` + `actions/release-attach`
 
-The release pipeline for a Tauri app on macOS. From a release tag it builds the
-app for Apple Silicon, signs it with a Developer ID identity, notarizes and
-staples it, zips it with `ditto`, attaches the zip to the tag's GitHub Release,
-and can then bump a Homebrew cask through `dispatch-and-wait.yml`.
+The release pipeline for a Tauri app on macOS is three composite actions, run
+as steps of **one job in the caller's own repository**:
 
-Steps: resolve the tag, check out the tag, check that `Cargo.toml` and
-`tauri.conf.json` state the tag's version, install Rust (and any Homebrew
-packages), `rust-cache`, pnpm and Node, `pnpm install --frozen-lockfile`,
-`tauri build --bundles app`, check the bundle's `CFBundleShortVersionString`,
-`macos-sign-notarize`, the smoke command, zip, wait for a green CI run on the
-tagged commit, attach.
+1. `tauri-macos-build` builds the app for Apple Silicon from the checked-out tag.
+2. `macos-sign-notarize` signs, notarizes and staples it (next section).
+3. `release-attach` zips it with `ditto`, waits for green CI, and attaches the zip.
+
+A cask bump follows as a `dispatch-and-wait.yml` job.
+
+**Environment secrets do not cross into a reusable workflow from another
+repository.** A called workflow's job can name the caller's environment, and
+the deployment is created, but the environment's secrets resolve empty there.
+That is why this pipeline is a set of actions, not a reusable workflow. Put
+the five signing secrets in a GitHub environment (e.g. `release`) limited to
+`v*` tags. The caller's job names that environment and passes each secret to
+`macos-sign-notarize` as an input. A branch push or a pull request cannot
+reach them. Re-run a release by dispatching the caller **on the tag**
+(`gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`); that run uses the
+caller workflow as it stood at the tag.
+
+The jobs run on macOS. macOS minutes are free for public repositories and
+metered at 10x for private ones.
+
+### `actions/tauri-macos-build`
+
+Steps: resolve the tag (strict `vX.Y.Z`), fail unless `HEAD` is the tag's
+commit, check that `Cargo.toml` and `tauri.conf.json` state the tag's version,
+install Rust (and any Homebrew packages), `rust-cache`, pnpm and Node,
+`pnpm install --frozen-lockfile`, `tauri build --bundles app`, check the
+bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
@@ -494,54 +514,45 @@ tagged commit, attach.
 | `tauri-command` | no | `''` → `<frontend-dir>/node_modules/.bin/tauri` | Tauri CLI command |
 | `brew-packages` | no | `''` | Homebrew packages, space-separated |
 | `check-versions` | no | `true` | Manifest versions must match the tag |
-| `smoke-command` | no | `''` | Run against the signed bundle; `$APP` holds its path |
-| `entitlements` | no | `''` | Entitlements plist |
-| `signing-identity` | no | `''` → no Developer ID signature | Full identity string |
-| `team-id` | no | `''` | Team ID the signature must carry |
-| `notarize` | no | `true` | Notarize and staple |
-| `environment` | no | `release` | Environment holding the signing secrets |
-| `require-ci-workflow` | no | `''` → skipped | Workflow file that must be green on the tagged commit |
-| `ci-timeout-minutes` | no | `40` | How long to wait for it |
-| `tap-repo` | no | `''` → no bump | Homebrew tap, `owner/name` |
-| `tap-formula` | no | `''` | Formula or cask name for the tap's bump |
-| `tap-workflow` | no | `bump.yml` | The tap's bump workflow |
-| `runner` | no | `macos-26` | macOS runner label |
-
-| Secret | Required | Meaning |
-|---|---|---|
-| `MAC_CERT_P12` | to sign | Base64 `.p12` (certificate and private key) |
-| `MAC_CERT_PASSWORD` | to sign | Its password |
-| `ASC_KEY_P8` | to notarize | App Store Connect API key, `.p8` PEM text |
-| `ASC_KEY_ID` | to notarize | Its key ID |
-| `ASC_ISSUER_ID` | to notarize | Its issuer ID |
-| `tap_token` | with `tap-repo` | PAT with `actions: write` on the tap |
 
 | Output | Meaning |
 |---|---|
 | `tag` | The release tag |
-| `asset` | File name of the attached zip |
+| `version` | The tag without its `v` |
+| `asset` | File name the zip should get |
+| `app` | Path of the built `.app` |
 
-Permissions the calling job must grant:
+### `actions/release-attach`
 
-```yaml
-permissions:
-  contents: write
-  actions: read
-```
+Steps: `codesign --verify --deep --strict`, the smoke command, `ditto` zip,
+wait for a green run of the CI workflow on `HEAD`, create the tag's release if
+missing, attach.
 
-**Signing secrets live in an environment, not in the caller.** Put the five
-signing secrets in a GitHub environment (default name `release`) limited to
-`v*` tags. The build job names that environment, so it reads them directly and
-the caller does not pass them. A branch push or a pull request cannot reach
-them. Because of that limit, re-run a release by dispatching the caller **on the
-tag**: `gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`.
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `path` | yes | — | The signed `.app` |
+| `tag` | yes | — | Release tag |
+| `asset` | yes | — | Zip file name |
+| `smoke-command` | no | `''` | Run against the bundle; `$APP` holds its path |
+| `require-ci-workflow` | no | `''` → skipped | Workflow file that must be green on `HEAD` |
+| `ci-timeout-minutes` | no | `40` | How long to wait for it |
+| `token` | no | `github.token` | Token for `gh` |
 
-**Never clobber.** If the tag's release already has the zip, the job keeps it
+| Output | Meaning |
+|---|---|
+| `asset-path` | Absolute path of the zip |
+| `sha256` | SHA-256 of the zip that was built |
+
+**Never clobber.** If the tag's release already has the zip, the step keeps it
 and succeeds. A cask pins the sha256 of what was published first, and a rebuilt
 zip is not byte-identical.
 
-The tap's bump workflow must follow `dispatch-and-wait.yml`'s target-side
-contract and take `{"formula": ..., "tag": ...}`.
+### Caller
+
+The release job needs `contents: write` and `actions: read`. The tap's bump
+workflow must follow `dispatch-and-wait.yml`'s target-side contract and take
+`{"formula": ..., "tag": ...}`. `tauri-macos-build` rejects any tag outside
+`vX.Y.Z`, so the tag is safe inside the JSON string.
 
 ```yaml
 on:
@@ -553,25 +564,64 @@ on:
         description: Existing tag to release
         required: true
 
+permissions: {}
+
 jobs:
   release:
-    uses: noahkiss/workflows/.github/workflows/tauri-macos-release.yml@main
+    runs-on: macos-26
+    environment: release
     permissions:
       contents: write
       actions: read
+    concurrency:
+      group: release-${{ inputs.tag || github.ref }}
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: build
+        uses: noahkiss/workflows/actions/tauri-macos-build@main
+        with:
+          tag: ${{ inputs.tag }}
+          app-name: MyApp
+          asset-prefix: myapp
+      - uses: noahkiss/workflows/actions/macos-sign-notarize@main
+        with:
+          path: ${{ steps.build.outputs.app }}
+          identity: 'Developer ID Application: Example Inc. (ABCDE12345)'
+          team-id: ABCDE12345
+          entitlements: src-tauri/Entitlements.plist
+          certificate-p12: ${{ secrets.MAC_CERT_P12 }}
+          certificate-password: ${{ secrets.MAC_CERT_PASSWORD }}
+          notary-key-p8: ${{ secrets.ASC_KEY_P8 }}
+          notary-key-id: ${{ secrets.ASC_KEY_ID }}
+          notary-issuer-id: ${{ secrets.ASC_ISSUER_ID }}
+      - uses: noahkiss/workflows/actions/release-attach@main
+        with:
+          path: ${{ steps.build.outputs.app }}
+          tag: ${{ steps.build.outputs.tag }}
+          asset: ${{ steps.build.outputs.asset }}
+          require-ci-workflow: ci.yml
+
+  bump-tap:
+    needs: release
+    permissions: {}
+    uses: noahkiss/workflows/.github/workflows/dispatch-and-wait.yml@main
     with:
-      tag: ${{ inputs.tag }}
-      app-name: MyApp
-      asset-prefix: myapp
-      entitlements: src-tauri/Entitlements.plist
-      signing-identity: 'Developer ID Application: Example Inc. (ABCDE12345)'
-      team-id: ABCDE12345
-      require-ci-workflow: ci.yml
-      tap-repo: example/homebrew-tap
-      tap-formula: myapp
+      repo: example/homebrew-tap
+      workflow: bump.yml
+      inputs_json: '{"formula":"myapp","tag":"${{ needs.release.outputs.tag }}"}'
+      timeout_minutes: 45
     secrets:
-      tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 ```
+
+The former reusable workflow `tauri-macos-release.yml` is gone. It could not
+read the caller's environment secrets, and a version that took them as repo
+secrets would drop the tag-only protection.
 
 ---
 
@@ -579,7 +629,8 @@ jobs:
 
 A composite action, usable on its own in any macOS job. It signs a `.app`
 bundle or a bare Mach-O binary with a Developer ID identity, notarizes it, and
-verifies the result. `tauri-macos-release.yml` uses it.
+verifies the result. The Tauri macOS release uses it between
+`tauri-macos-build` and `release-attach`.
 
 1. Imports the `.p12` into a throwaway keychain.
 2. Signs with `--options runtime --timestamp`. A bundle is signed inside out:

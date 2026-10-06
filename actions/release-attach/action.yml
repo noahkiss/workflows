@@ -1,0 +1,110 @@
+name: Release attach
+description: >-
+  Verify a signed macOS .app, run an optional smoke command against it, zip it
+  with ditto, wait for a green CI run on the checked-out commit, and attach the
+  zip to a tag's GitHub Release. Never replaces an asset that is already
+  attached. Needs `contents: write` (and `actions: read` for the CI wait).
+
+inputs:
+  path:
+    description: The .app bundle to zip, relative to the workspace or absolute.
+    required: true
+  tag:
+    description: Release tag the zip is attached to. The release is created when missing.
+    required: true
+  asset:
+    description: File name of the zip, e.g. myapp-1.2.3-arm64.zip.
+    required: true
+  smoke-command:
+    description: Command run against the bundle before it is zipped. $APP holds its path.
+    required: false
+    default: ''
+  require-ci-workflow:
+    description: Workflow file (e.g. ci.yml) that must have a green run on HEAD before anything is attached. Empty skips the check.
+    required: false
+    default: ''
+  ci-timeout-minutes:
+    description: How long to wait for that run.
+    required: false
+    default: '40'
+  token:
+    description: Token for gh. Needs contents write, and actions read for the CI wait.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  asset-path:
+    description: Absolute path of the zip.
+    value: ${{ steps.zip.outputs.asset-path }}
+  sha256:
+    description: SHA-256 of the zip that was built. The attached one differs when an earlier zip was kept.
+    value: ${{ steps.zip.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Smoke test and zip
+      id: zip
+      shell: bash
+      env:
+        APP: ${{ inputs.path }}
+        ASSET: ${{ inputs.asset }}
+        SMOKE: ${{ inputs.smoke-command }}
+      run: |
+        set -euo pipefail
+        [ -d "$APP" ] || { echo "::error::no bundle at ${APP}"; exit 1; }
+        codesign --verify --deep --strict "$APP"
+        if [ -n "$SMOKE" ]; then bash -euo pipefail -c "$SMOKE"; fi
+        # ditto keeps the signature, the stapled ticket and the bundle's symlinks.
+        out="$GITHUB_WORKSPACE/$ASSET"
+        ditto -c -k --sequesterRsrc --keepParent "$APP" "$out"
+        sum="$(shasum -a 256 "$out" | cut -d' ' -f1)"
+        echo "${sum}  ${ASSET}"
+        {
+          echo "asset-path=${out}"
+          echo "sha256=${sum}"
+        } >> "$GITHUB_OUTPUT"
+
+    # Callers usually run their tests on every push. The release waits for
+    # that run on the tagged commit instead of repeating it. The check sits
+    # after the build, so the two overlap, and before anything is attached.
+    - name: Require a green CI run on the tagged commit
+      if: inputs.require-ci-workflow != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        CI_WORKFLOW: ${{ inputs.require-ci-workflow }}
+        TIMEOUT: ${{ inputs.ci-timeout-minutes }}
+      run: |
+        set -euo pipefail
+        sha="$(git rev-parse HEAD)"
+        for _ in $(seq 1 $((TIMEOUT * 2))); do
+          run="$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --limit 1 --json status,conclusion,url --jq '.[0] // empty')"
+          if [ -n "$run" ] && [ "$(jq -r .status <<<"$run")" = completed ]; then
+            conclusion="$(jq -r .conclusion <<<"$run")"
+            [ "$conclusion" = success ] || { echo "::error::${CI_WORKFLOW} on ${sha} ended ${conclusion}: $(jq -r .url <<<"$run")"; exit 1; }
+            echo "CI passed: $(jq -r .url <<<"$run")"; exit 0
+          fi
+          sleep 30
+        done
+        echo "::error::no finished ${CI_WORKFLOW} run on ${sha} after ${TIMEOUT} minutes"; exit 1
+
+    - name: Attach to the release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag }}
+        ASSET: ${{ inputs.asset }}
+        ASSET_PATH: ${{ steps.zip.outputs.asset-path }}
+      run: |
+        set -euo pipefail
+        gh release view "$TAG" >/dev/null 2>&1 \
+          || gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+        # Never clobber. A cask pins the sha256 of whatever was attached first.
+        if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$ASSET"; then
+          echo "::notice::${ASSET} is already attached to ${TAG}; keeping the published one"
+          exit 0
+        fi
+        gh release upload "$TAG" "$ASSET_PATH"
