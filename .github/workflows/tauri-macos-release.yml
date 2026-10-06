@@ -10,7 +10,9 @@ name: Tauri macOS release
 # Signing secrets come from a GitHub environment (`environment`, default
 # `release`). Limit that environment to `v*` tags so a branch or a pull request
 # cannot read them. A job in a called workflow that names an environment reads
-# that environment's secrets, so the caller does not pass them.
+# that environment's secrets, so the caller does not pass them. Do not declare them under
+# workflow_call.secrets: a declared secret the caller does not pass resolves empty and hides
+# the environment's value.
 #
 # A re-run never replaces an asset that is already attached: a cask pins the
 # sha256 of what was published first, and a rebuilt zip is not byte-identical.
@@ -127,21 +129,6 @@ on:
         type: string
         default: macos-26
     secrets:
-      MAC_CERT_P12:
-        description: Base64 .p12. Normally read from the environment, not passed.
-        required: false
-      MAC_CERT_PASSWORD:
-        description: The .p12 password.
-        required: false
-      ASC_KEY_P8:
-        description: App Store Connect API key (.p8 PEM text).
-        required: false
-      ASC_KEY_ID:
-        description: The API key's ID.
-        required: false
-      ASC_ISSUER_ID:
-        description: The API key's issuer ID.
-        required: false
       tap_token:
         description: "PAT with `actions: write` on the tap. Required when tap-repo is set."
         required: false
