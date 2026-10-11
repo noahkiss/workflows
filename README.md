@@ -732,9 +732,17 @@ the login keychain.
 
 ## `upstream-sync.yml`
 
-Keeps a patch series rebased on top of an upstream branch. The series is every
-commit on `target_branch` that is not on the upstream branch. It must sit purely
-on top of upstream: a series that merges upstream does not fit.
+Keeps a branch in step with an upstream branch. `strategy` picks how:
+
+| Strategy | Fits | What `sync` does |
+|---|---|---|
+| `rebase` (default) | A branch that carries a patch series: every commit not on the upstream branch, sitting purely on top of it | Rebases the series onto the upstream tip. A series that merges upstream does not fit |
+| `fast-forward` | A mirror: the default branch of a fork that sends pull requests upstream | Moves the branch to the upstream tip. A branch with commits of its own is reported as diverged and left alone |
+
+`promote: true` skips the candidate branch and the caller's build: `sync` pushes
+straight to the target with the same backup and lease `finish` uses. Use it for
+a mirror, and for feature branches whose pull requests upstream run upstream's
+CI — call the workflow once per branch, or from a `matrix` over branch names.
 
 A reusable workflow cannot take a job as an input, so the build stays in the
 caller. The file has two modes, called as two jobs of one caller run with the
@@ -743,7 +751,7 @@ caller's build job between them:
 | Mode | What it does |
 |---|---|
 | `sync` | Fetches upstream. The old base is the merge-base of the target and the upstream tip. If upstream has not moved, it outputs `changed=false` and stops. Otherwise it rebases the series onto the upstream tip and force-pushes the result to the candidate branch. On a conflict it opens or updates the sync issue and fails. |
-| `finish` | Takes the build verdict. On `success` it pushes the old target tip to a backup branch, then force-pushes the candidate to the target with a lease on the old tip. On `failure` it opens or updates the sync issue and fails. On any other result it fails without changing anything. |
+| `finish` | Not needed with `promote: true`. Takes the build verdict. On `success` it pushes the old target tip to a backup branch, then force-pushes the candidate to the target with a lease on the old tip. On `failure` it opens or updates the sync issue and fails. On any other result it fails without changing anything. |
 
 | Input | Mode | Required | Default | Meaning |
 |---|---|---|---|---|
@@ -752,13 +760,15 @@ caller's build job between them:
 | `candidate_branch` | both | no | `''` → `sync/<target_branch>` | Branch the rebased series is pushed to |
 | `issue_label` | both | no | `upstream-sync` | Label on the sync issue; created if missing |
 | `upstream_url` | sync | yes | — | Clone URL of the upstream repository |
-| `upstream_branch` | sync | no | `main` | Upstream branch to rebase onto |
+| `upstream_branch` | sync | no | `main` | Upstream branch to follow |
+| `strategy` | sync | no | `rebase` | `rebase` or `fast-forward` |
+| `promote` | sync | no | `false` | Push straight to the target; no candidate branch, no `finish` |
 | `candidate_ref` | sync | no | `''` | Skip the rebase; adopt this origin branch or SHA as the candidate. It must contain the upstream tip |
 | `candidate_sha` | finish | yes | — | The sync output |
 | `target_sha` | finish | yes | — | The sync output |
 | `build_result` | finish | yes | — | `needs.<build job>.result` |
 | `range_diff` | finish | no | `''` | The sync output, quoted in the issue on a red build |
-| `keep_backups` | finish | no | `5` | How many `backup/<target_branch>-pre-sync-*` branches to keep |
+| `keep_backups` | finish, or sync with `promote` | no | `5` | How many `backup/<target_branch>-pre-sync-*` branches to keep |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -787,10 +797,11 @@ the push if anything landed on the target after `sync` read it. A branch
 protection rule or ruleset that blocks force-pushes on the target makes
 `finish` fail; this workflow does not change protection.
 
-**Backups.** Before each promotion the old tip goes to
+**Backups.** Before each promotion that rewrites the target, the old tip goes to
 `backup/<target_branch>-pre-sync-<YYYY-MM-DD>-<sha>`. The newest `keep_backups`
 are kept and older ones are deleted. A backup is the `<old-tip>` a range-diff or
-a bisect needs after the rewrite.
+a bisect needs after the rewrite. A fast-forward rewrites nothing and makes no
+backup.
 
 **The sync issue.** One open issue per target, titled
 `Upstream sync failed: <target_branch>`. A later failure comments on it instead
@@ -861,3 +872,38 @@ jobs:
       build_result: ${{ needs.build.result }}
       range_diff: ${{ needs.sync.outputs.range_diff }}
 ```
+
+A fork that sends pull requests upstream keeps its default branch as a mirror,
+and can keep its open pull-request branches rebased the same way:
+
+```yaml
+jobs:
+  mirror:
+    permissions:
+      contents: write
+      issues: write
+    uses: noahkiss/workflows/.github/workflows/upstream-sync.yml@main
+    with:
+      mode: sync
+      strategy: fast-forward
+      promote: true
+      upstream_url: https://github.com/upstream-owner/project.git
+
+  feature-branches:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [fix/one-thing, feat/another]
+    permissions:
+      contents: write
+      issues: write
+    uses: noahkiss/workflows/.github/workflows/upstream-sync.yml@main
+    with:
+      mode: sync
+      promote: true
+      target_branch: ${{ matrix.branch }}
+      upstream_url: https://github.com/upstream-owner/project.git
+```
+
+A rebased pull-request branch is force-pushed, which updates the open pull
+request upstream. Leave a branch out of the matrix while a review is under way.
