@@ -57,8 +57,8 @@ caller is invisible here. Pass values as inputs.
 A called workflow's jobs run inside the *caller's* workflow run, so there is no
 separate run for a workflow-level `concurrency:` block here to scope to. GitHub's
 own reusable-workflow reference discusses the guard only in its
-`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`
-and `cf-pages-deploy` each carry a job-level guard.
+`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`,
+`cf-pages-deploy` and `upstream-sync` each carry a job-level guard.
 
 Each group name starts with a literal unique to its file. That is deliberate.
 The docs warn:
@@ -727,3 +727,137 @@ variables (`SIGN_PATH`, `SIGN_IDENTITY`, `SIGN_TEAM_ID`, `SIGN_ENTITLEMENTS`,
 `SIGN_IDENTIFIER`, `SIGN_NOTARIZE`, `ASC_KEY_P8`, `ASC_KEY_ID`,
 `ASC_ISSUER_ID`). Leave `MAC_CERT_P12` unset and it signs with the identity in
 the login keychain.
+
+---
+
+## `upstream-sync.yml`
+
+Keeps a patch series rebased on top of an upstream branch. The series is every
+commit on `target_branch` that is not on the upstream branch. It must sit purely
+on top of upstream: a series that merges upstream does not fit.
+
+A reusable workflow cannot take a job as an input, so the build stays in the
+caller. The file has two modes, called as two jobs of one caller run with the
+caller's build job between them:
+
+| Mode | What it does |
+|---|---|
+| `sync` | Fetches upstream. The old base is the merge-base of the target and the upstream tip. If upstream has not moved, it outputs `changed=false` and stops. Otherwise it rebases the series onto the upstream tip and force-pushes the result to the candidate branch. On a conflict it opens or updates the sync issue and fails. |
+| `finish` | Takes the build verdict. On `success` it pushes the old target tip to a backup branch, then force-pushes the candidate to the target with a lease on the old tip. On `failure` it opens or updates the sync issue and fails. On any other result it fails without changing anything. |
+
+| Input | Mode | Required | Default | Meaning |
+|---|---|---|---|---|
+| `mode` | both | yes | — | `sync` or `finish` |
+| `target_branch` | both | no | `main` | Branch that carries the series |
+| `candidate_branch` | both | no | `''` → `sync/<target_branch>` | Branch the rebased series is pushed to |
+| `issue_label` | both | no | `upstream-sync` | Label on the sync issue; created if missing |
+| `upstream_url` | sync | yes | — | Clone URL of the upstream repository |
+| `upstream_branch` | sync | no | `main` | Upstream branch to rebase onto |
+| `candidate_ref` | sync | no | `''` | Skip the rebase; adopt this origin branch or SHA as the candidate. It must contain the upstream tip |
+| `candidate_sha` | finish | yes | — | The sync output |
+| `target_sha` | finish | yes | — | The sync output |
+| `build_result` | finish | yes | — | `needs.<build job>.result` |
+| `range_diff` | finish | no | `''` | The sync output, quoted in the issue on a red build |
+| `keep_backups` | finish | no | `5` | How many `backup/<target_branch>-pre-sync-*` branches to keep |
+
+| Secret | Required | Meaning |
+|---|---|---|
+| `token` | no | Token for git pushes, when the job's `GITHUB_TOKEN` cannot push (a ruleset, or a push GitHub refuses for workflow files). Defaults to `GITHUB_TOKEN` |
+
+| Output | Meaning |
+|---|---|
+| `changed` | `'true'` when a candidate was pushed |
+| `candidate_sha` | SHA of the candidate |
+| `target_sha` | Target tip the candidate replaces; pass it to `finish` |
+| `old_base` / `new_base` | Upstream commit before and after |
+| `range_diff` | `git range-diff` of the old series against the candidate, truncated to 20,000 characters |
+| `range_diff_summary` | One line, for example `3 patches; 2 unchanged, 1 changed, 0 dropped, 0 added` |
+
+Permissions the calling jobs must grant, to both the `sync` and `finish` jobs:
+
+```yaml
+permissions:
+  contents: write
+  issues: write
+```
+
+**The target is rewritten.** A rebase gives every patch a new SHA, so promotion
+is a force-push. The lease (`--force-with-lease=<target>:<target_sha>`) fails
+the push if anything landed on the target after `sync` read it. A branch
+protection rule or ruleset that blocks force-pushes on the target makes
+`finish` fail; this workflow does not change protection.
+
+**Backups.** Before each promotion the old tip goes to
+`backup/<target_branch>-pre-sync-<YYYY-MM-DD>-<sha>`. The newest `keep_backups`
+are kept and older ones are deleted. A backup is the `<old-tip>` a range-diff or
+a bisect needs after the rewrite.
+
+**The sync issue.** One open issue per target, titled
+`Upstream sync failed: <target_branch>`. A later failure comments on it instead
+of opening another. A promotion closes it. On a conflict the body names the
+conflicting patch and its position in the series, the conflicted files, the
+upstream commits that touch them, the conflict hunks, a range-diff of the
+patches that applied, and the commands to reproduce. Issues opened with
+`GITHUB_TOKEN` start no workflow runs, so an agent fixer should trigger on
+`workflow_run` of the caller's failure, not on the issue.
+
+**Repairing a series.** Push the repaired series to a branch, then dispatch the
+caller with `candidate_ref` set to it. The candidate is built and promoted like
+a nightly one.
+
+Put a workflow-level `concurrency` group in the caller as well, so a second run
+waits until the first has finished its `finish` job. Give it a name different
+from `upstream-sync-…`, which the jobs here use.
+
+```yaml
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: my-repo-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    permissions:
+      contents: write
+      issues: write
+    uses: noahkiss/workflows/.github/workflows/upstream-sync.yml@main
+    with:
+      mode: sync
+      upstream_url: https://github.com/upstream-owner/project.git
+      candidate_ref: ${{ inputs.candidate_ref }}
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml   # must accept a `ref` input
+    with:
+      ref: ${{ needs.sync.outputs.candidate_sha }}
+
+  finish:
+    needs: [sync, build]
+    if: ${{ !cancelled() && needs.sync.outputs.changed == 'true' }}
+    permissions:
+      contents: write
+      issues: write
+    uses: noahkiss/workflows/.github/workflows/upstream-sync.yml@main
+    with:
+      mode: finish
+      candidate_sha: ${{ needs.sync.outputs.candidate_sha }}
+      target_sha: ${{ needs.sync.outputs.target_sha }}
+      build_result: ${{ needs.build.result }}
+      range_diff: ${{ needs.sync.outputs.range_diff }}
+```
