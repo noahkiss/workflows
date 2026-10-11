@@ -46,6 +46,18 @@ inputs:
     description: Fail unless Cargo.toml and tauri.conf.json both state the tag's version.
     required: false
     default: 'true'
+  updater-private-key:
+    description: >-
+      The Tauri updater key, for an app whose config sets createUpdaterArtifacts.
+      Passed to the build as TAURI_SIGNING_PRIVATE_KEY; empty passes nothing.
+      That archive holds the app before macos-sign-notarize, so release-attach's
+      `updater` makes one from the final bundle instead.
+    required: false
+    default: ''
+  updater-private-key-password:
+    description: Its password (TAURI_SIGNING_PRIVATE_KEY_PASSWORD); empty for a key without one.
+    required: false
+    default: ''
 
 outputs:
   tag:
@@ -155,8 +167,15 @@ runs:
       env:
         TAURI_COMMAND: ${{ inputs.tauri-command }}
         FRONTEND_DIR: ${{ inputs.frontend-dir }}
+        UPDATER_KEY: ${{ inputs.updater-private-key }}
+        UPDATER_KEY_PASSWORD: ${{ inputs.updater-private-key-password }}
       run: |
         set -euo pipefail
+        if [ -n "$UPDATER_KEY" ]; then
+          export TAURI_SIGNING_PRIVATE_KEY="$UPDATER_KEY"
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEY_PASSWORD"
+        fi
+        unset UPDATER_KEY UPDATER_KEY_PASSWORD
         cmd="$TAURI_COMMAND"
         [ -n "$cmd" ] || cmd="$GITHUB_WORKSPACE/$FRONTEND_DIR/node_modules/.bin/tauri"
         read -ra tauri <<<"$cmd"

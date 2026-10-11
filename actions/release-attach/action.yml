@@ -3,7 +3,9 @@ description: >-
   Verify a signed macOS .app, run an optional smoke command against it, zip it
   with ditto, wait for a green CI run on the checked-out commit, and attach the
   zip to a tag's GitHub Release. Never replaces an asset that is already
-  attached. Needs `contents: write` (and `actions: read` for the CI wait).
+  attached. With `updater: true` it also attaches a Tauri updater archive of
+  the same bundle, its signature and a latest.json. Needs `contents: write`
+  (and `actions: read` for the CI wait).
 
 inputs:
   path:
@@ -31,6 +33,30 @@ inputs:
     description: Token for gh. Needs contents write, and actions read for the CI wait.
     required: false
     default: ${{ github.token }}
+  updater:
+    description: "true: also attach <asset without .zip>.app.tar.gz, its .sig, and latest.json for tauri-plugin-updater. Run it after macos-sign-notarize: the archive must hold the stapled app."
+    required: false
+    default: 'false'
+  updater-private-key:
+    description: The updater key (the text `tauri signer generate` wrote). Pass a secret.
+    required: false
+    default: ''
+  updater-private-key-password:
+    description: Its password; empty for a key without one.
+    required: false
+    default: ''
+  updater-target:
+    description: The latest.json platform key.
+    required: false
+    default: darwin-aarch64
+  updater-notes:
+    description: The latest.json notes. Empty means the release's body.
+    required: false
+    default: ''
+  tauri-command:
+    description: Command that runs the Tauri CLI, for `tauri signer sign`; relative to the workspace or absolute.
+    required: false
+    default: app/node_modules/.bin/tauri
 
 outputs:
   asset-path:
@@ -39,6 +65,9 @@ outputs:
   sha256:
     description: SHA-256 of the zip that was built. The attached one differs when an earlier zip was kept.
     value: ${{ steps.zip.outputs.sha256 }}
+  updater-archive:
+    description: File name of the updater archive, when `updater` is true.
+    value: ${{ steps.updater.outputs.archive }}
 
 runs:
   using: composite
@@ -65,6 +94,28 @@ runs:
           echo "sha256=${sum}"
         } >> "$GITHUB_OUTPUT"
 
+    # Made before the CI wait, so a bad key fails early, and from the final bundle: Tauri's
+    # own updater archive holds the app as built, before it was signed and stapled.
+    - name: Make the updater archive
+      id: updater
+      if: inputs.updater == 'true'
+      shell: bash
+      env:
+        APP: ${{ inputs.path }}
+        ASSET: ${{ inputs.asset }}
+        TAG: ${{ inputs.tag }}
+        TAURI_COMMAND: ${{ inputs.tauri-command }}
+        TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.updater-private-key }}
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.updater-private-key-password }}
+      run: |
+        set -euo pipefail
+        archive="${ASSET%.zip}.app.tar.gz"
+        tauri="$TAURI_COMMAND"
+        [[ "$tauri" == /* ]] || tauri="$GITHUB_WORKSPACE/$tauri"
+        APP="$APP" OUT="$RUNNER_TEMP/$archive" VERSION="${TAG#v}" TAURI="$tauri" \
+          "$GITHUB_ACTION_PATH/updater-archive.sh"
+        echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
     # Callers usually run their tests on every push. The release waits for
     # that run on the tagged commit instead of repeating it. The check sits
     # after the build, so the two overlap, and before anything is attached.
@@ -79,12 +130,15 @@ runs:
       run: |
         set -euo pipefail
         sha="$(git rev-parse HEAD)"
+        # Any green run on this commit counts: a release branch's run passes
+        # before the tag push starts another one on the same commit.
         for _ in $(seq 1 $((TIMEOUT * 2))); do
-          run="$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --limit 1 --json status,conclusion,url --jq '.[0] // empty')"
-          if [ -n "$run" ] && [ "$(jq -r .status <<<"$run")" = completed ]; then
-            conclusion="$(jq -r .conclusion <<<"$run")"
-            [ "$conclusion" = success ] || { echo "::error::${CI_WORKFLOW} on ${sha} ended ${conclusion}: $(jq -r .url <<<"$run")"; exit 1; }
-            echo "CI passed: $(jq -r .url <<<"$run")"; exit 0
+          runs="$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --limit 20 --json status,conclusion,url)"
+          green="$(jq -r '[.[] | select(.conclusion == "success")][0].url // empty' <<<"$runs")"
+          if [ -n "$green" ]; then echo "CI passed: $green"; exit 0; fi
+          open="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+          if [ "$(jq length <<<"$runs")" -gt 0 ] && [ "$open" -eq 0 ]; then
+            echo "::error::every ${CI_WORKFLOW} run on ${sha} ended without success: $(jq -r '.[0].url' <<<"$runs")"; exit 1
           fi
           sleep 30
         done
@@ -108,3 +162,45 @@ runs:
           exit 0
         fi
         gh release upload "$TAG" "$ASSET_PATH"
+
+    # The archive and its signature are never replaced, like the zip. latest.json always
+    # names the archive that is attached, with that archive's signature, so a re-run
+    # repairs a missing or stale latest.json without breaking an installed app's update.
+    - name: Attach the updater files
+      if: inputs.updater == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag }}
+        ARCHIVE: ${{ steps.updater.outputs.archive }}
+        TARGET: ${{ inputs.updater-target }}
+        RELEASE_NOTES: ${{ inputs.updater-notes }}
+      run: |
+        set -euo pipefail
+        made="$RUNNER_TEMP/$ARCHIVE"
+        attached="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+        if grep -qx "$ARCHIVE" <<<"$attached"; then
+          grep -qx "$ARCHIVE.sig" <<<"$attached" \
+            || { echo "::error::${ARCHIVE} is attached to ${TAG} without ${ARCHIVE}.sig"; exit 1; }
+          echo "::notice::${ARCHIVE} is already attached to ${TAG}; keeping the published one"
+          sig_file="$RUNNER_TEMP/attached.sig"
+          gh release download "$TAG" -p "$ARCHIVE.sig" -O "$sig_file" --clobber
+        else
+          gh release upload "$TAG" "$made" "$made.sig"
+          sig_file="$made.sig"
+        fi
+        notes="$RELEASE_NOTES"
+        [ -n "$notes" ] || notes="$(gh release view "$TAG" --json body --jq .body)"
+        jq -n \
+          --arg version "${TAG#v}" \
+          --arg notes "$notes" \
+          --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg target "$TARGET" \
+          --arg signature "$(cat "$sig_file")" \
+          --arg url "https://github.com/${GH_REPO}/releases/download/${TAG}/${ARCHIVE}" \
+          '{version: $version, notes: $notes, pub_date: $pub_date,
+            platforms: {($target): {signature: $signature, url: $url}}}' \
+          > "$RUNNER_TEMP/latest.json"
+        jq -e '.platforms[].signature | length > 0' "$RUNNER_TEMP/latest.json" >/dev/null
+        gh release upload "$TAG" "$RUNNER_TEMP/latest.json" --clobber

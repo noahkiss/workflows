@@ -477,6 +477,8 @@ as steps of **one job in the caller's own repository**:
 1. `tauri-macos-build` builds the app for Apple Silicon from the checked-out tag.
 2. `macos-sign-notarize` signs, notarizes and staples it (next section).
 3. `release-attach` zips it with `ditto`, waits for green CI, and attaches the zip.
+   With `updater: true` it also attaches the in-app updater's files (see
+   [Tauri updater](#tauri-updater)).
 
 A cask bump follows as a `dispatch-and-wait.yml` job.
 
@@ -514,6 +516,8 @@ bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 | `tauri-command` | no | `''` → `<frontend-dir>/node_modules/.bin/tauri` | Tauri CLI command |
 | `brew-packages` | no | `''` | Homebrew packages, space-separated |
 | `check-versions` | no | `true` | Manifest versions must match the tag |
+| `updater-private-key` | no | `''` → not passed | `TAURI_SIGNING_PRIVATE_KEY` for the build, for a config with `createUpdaterArtifacts` |
+| `updater-private-key-password` | no | `''` | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 
 | Output | Meaning |
 |---|---|
@@ -537,15 +541,47 @@ missing, attach.
 | `require-ci-workflow` | no | `''` → skipped | Workflow file that must be green on `HEAD` |
 | `ci-timeout-minutes` | no | `40` | How long to wait for it |
 | `token` | no | `github.token` | Token for `gh` |
+| `updater` | no | `false` | `true`: also attach the updater archive, its `.sig` and `latest.json` |
+| `updater-private-key` | with `updater` | `''` | The updater key, from a secret |
+| `updater-private-key-password` | no | `''` | Its password; empty for none |
+| `updater-target` | no | `darwin-aarch64` | The platform key in `latest.json` |
+| `updater-notes` | no | `''` → the release body | `notes` in `latest.json` |
+| `tauri-command` | no | `app/node_modules/.bin/tauri` | Tauri CLI for `tauri signer sign` |
 
 | Output | Meaning |
 |---|---|
 | `asset-path` | Absolute path of the zip |
 | `sha256` | SHA-256 of the zip that was built |
+| `updater-archive` | File name of the updater archive |
 
 **Never clobber.** If the tag's release already has the zip, the step keeps it
 and succeeds. A cask pins the sha256 of what was published first, and a rebuilt
 zip is not byte-identical.
+
+### Tauri updater
+
+For an app on `tauri-plugin-updater`, `release-attach` with `updater: true`
+attaches three more files:
+
+- `<asset without .zip>.app.tar.gz`: the bundle as `release-attach` received
+  it, so signed, notarized and stapled.
+- its `.sig`, from `tauri signer sign --app-version <version>`. The version is
+  in the signed comment, so a config with `requireSignedVersion` accepts it.
+- `latest.json`: `version`, `notes`, `pub_date` and
+  `platforms.<updater-target>` with the `.sig` text and the archive's
+  download URL. Point the app's `plugins.updater.endpoints` at
+  `https://github.com/<owner>/<repo>/releases/latest/download/latest.json`.
+
+The order matters. Tauri's own `createUpdaterArtifacts` archives the bundle
+during `tauri build`, before `macos-sign-notarize` re-signs and staples it, so
+that archive would install an app Gatekeeper has not seen. Leave
+`createUpdaterArtifacts` off and let `release-attach` archive the final
+bundle. It unpacks its archive and runs `codesign --verify --deep --strict`
+and `xcrun stapler validate` on the copy before it signs.
+
+The archive and its `.sig` are never replaced, like the zip. A re-run keeps
+them and writes `latest.json` again from the attached `.sig`. Keep the key in
+the same environment as the signing secrets.
 
 ### Caller
 
@@ -605,6 +641,10 @@ jobs:
           tag: ${{ steps.build.outputs.tag }}
           asset: ${{ steps.build.outputs.asset }}
           require-ci-workflow: ci.yml
+          # Only for an app on tauri-plugin-updater:
+          updater: true
+          updater-private-key: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          updater-private-key-password: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   bump-tap:
     needs: release
