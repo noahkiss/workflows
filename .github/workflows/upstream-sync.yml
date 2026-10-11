@@ -1,15 +1,22 @@
 name: Upstream sync
 
-# Keeps a patch series rebased on top of an upstream branch. The series is every
-# commit on target_branch that is not on the upstream branch; it must sit
-# purely on top of upstream, never merged with it.
+# Keeps a branch in step with an upstream branch. Two strategies:
+#
+#   rebase        target_branch carries a patch series: every commit not on the
+#                 upstream branch. It must sit purely on top of upstream, never
+#                 merged with it. The series is rebased onto the upstream tip.
+#   fast-forward  target_branch mirrors upstream, as the default branch of a
+#                 fork that sends pull requests upstream does. It moves to the
+#                 upstream tip; if it carries commits of its own, that is
+#                 reported, never overwritten.
 #
 # One file, two modes, called as two jobs of the same caller run with the
 # caller's own build job between them:
 #
-#   sync    Fetch upstream. If it moved, rebase the series onto it, push the
-#           result to candidate_branch and output its SHA. On a conflict, open
-#           or update an issue and fail.
+#   sync    Fetch upstream. If it moved, build the candidate (a rebase or the
+#           upstream tip), push it to candidate_branch and output its SHA. On a
+#           conflict or divergence, open or update an issue and fail. With
+#           promote: true, push to target_branch at once instead; no finish.
 #   finish  Given the build verdict on the candidate: on success, back up the
 #           old tip and force-push the candidate to target_branch with a lease
 #           on the old tip. On failure, open or update an issue and fail.
@@ -25,7 +32,7 @@ on:
         required: true
         type: string
       target_branch:
-        description: Branch that carries the patch series.
+        description: Branch kept in step with upstream.
         required: false
         type: string
         default: main
@@ -50,6 +57,20 @@ on:
         required: false
         type: string
         default: main
+      strategy:
+        description: sync only. rebase (a patch series) or fast-forward (a mirror).
+        required: false
+        type: string
+        default: rebase
+      promote:
+        description: >-
+          sync only. Push the result straight to target_branch, with the same
+          backup and lease as finish, and skip the candidate branch. For a
+          branch with no build gate in this repository: a mirror, or a feature
+          branch whose pull request upstream runs its own CI.
+        required: false
+        type: boolean
+        default: false
       candidate_ref:
         description: >-
           sync only. Skip the rebase and adopt this origin branch or SHA as the
@@ -80,7 +101,9 @@ on:
         type: string
         default: ''
       keep_backups:
-        description: finish only. How many backup/<target_branch>-pre-sync-* branches to keep.
+        description: >-
+          finish, or sync with promote. How many backup/<target_branch>-pre-sync-*
+          branches to keep. A fast-forward makes no backup.
         required: false
         type: number
         default: 5
@@ -93,7 +116,7 @@ on:
         required: false
     outputs:
       changed:
-        description: "'true' when upstream moved and a candidate was pushed."
+        description: "'true' when upstream moved and a candidate was pushed (or promoted)."
         value: ${{ jobs.sync.outputs.changed }}
       candidate_sha:
         description: SHA of the pushed candidate.
@@ -168,9 +191,14 @@ jobs:
           UPSTREAM_URL: ${{ inputs.upstream_url }}
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          STRATEGY: ${{ inputs.strategy }}
         run: |
           set -euo pipefail
 
+          case "$STRATEGY" in
+            rebase|fast-forward) ;;
+            *) echo "strategy must be rebase or fast-forward; got '${STRATEGY}'" >&2; exit 1 ;;
+          esac
           if [ -z "$UPSTREAM_URL" ]; then
             echo "upstream_url is required in sync mode." >&2
             exit 1
@@ -198,6 +226,37 @@ jobs:
               exit 1
             fi
             echo "Adopting ${CANDIDATE_REF} (${candidate}) as the candidate."
+          elif [ "$STRATEGY" = fast-forward ]; then
+            if git merge-base --is-ancestor "$new_base" "$target_sha"; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "${TARGET} already contains upstream ${UPSTREAM_BRANCH} at ${new_base}. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor "$target_sha" "$new_base"; then
+              body="$RUNNER_TEMP/issue.md"
+              {
+                echo "## ${TARGET} has diverged from upstream"
+                echo
+                echo "- Run: ${RUN_URL}"
+                echo "- Target: \`${TARGET}\` at \`${target_sha}\`"
+                echo "- Upstream: \`${UPSTREAM_URL}\` \`${UPSTREAM_BRANCH}\` at \`${new_base}\`"
+                echo
+                echo "A fast-forward would drop these commits, so nothing was pushed:"
+                echo
+                echo '```'
+                git log -n 50 --format='%h %s' "${new_base}..${target_sha}"
+                echo '```'
+                echo
+                echo "Move them to a branch, then reset \`${TARGET}\` to upstream, or switch this caller to \`strategy: rebase\`."
+              } > "$body"
+              {
+                echo "changed=false"
+                echo "conflict=true"
+              } >> "$GITHUB_OUTPUT"
+              cat "$body" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            candidate="$new_base"
           elif [ "$old_base" = "$new_base" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Upstream ${UPSTREAM_BRANCH} has not moved since ${new_base}. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
@@ -271,12 +330,18 @@ jobs:
             candidate=$(git rev-parse HEAD)
           fi
 
-          range_diff=$(git range-diff --no-color "${old_base}..${target_sha}" "${new_base}..${candidate}")
-          summary=$(awk '
+          if git merge-base --is-ancestor "$target_sha" "$candidate"; then
+            # A fast-forward: nothing is rewritten, so there is no series to compare.
+            range_diff=""
+            summary="fast-forward by $(git rev-list --count "${target_sha}..${candidate}") commits"
+          else
+            range_diff=$(git range-diff --no-color "${old_base}..${target_sha}" "${new_base}..${candidate}")
+            summary=$(awk '
             $3 == "=" { same++ } $3 == "!" { changed++ }
             $3 == "<" { dropped++ } $3 == ">" { added++ }
             END { printf "%d patches; %d unchanged, %d changed, %d dropped, %d added",
                   same + changed + dropped + added, same, changed, dropped, added }' <<< "$range_diff")
+          fi
           {
             echo "changed=true"
             echo "candidate_sha=${candidate}"
@@ -296,7 +361,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Push the candidate
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.rebase.outputs.changed == 'true' && !inputs.promote
         env:
           SHA: ${{ steps.rebase.outputs.candidate_sha }}
         run: |
@@ -305,6 +370,40 @@ jobs:
           current=$(git ls-remote origin "refs/heads/${CANDIDATE}" | cut -f1)
           git push --force-with-lease="refs/heads/${CANDIDATE}:${current}" origin "${SHA}:refs/heads/${CANDIDATE}"
           echo "Pushed ${SHA} to ${CANDIDATE}."
+
+      - name: Promote the result
+        if: steps.rebase.outputs.changed == 'true' && inputs.promote
+        env:
+          CANDIDATE_SHA: ${{ steps.rebase.outputs.candidate_sha }}
+          TARGET_SHA: ${{ steps.rebase.outputs.target_sha }}
+          KEEP: ${{ inputs.keep_backups }}
+        run: |
+          set -euo pipefail
+          # Same steps as finish's "Promote the candidate"; keep the two in step.
+          prefix="backup/${TARGET}-pre-sync-"
+          if git merge-base --is-ancestor "$TARGET_SHA" "$CANDIDATE_SHA"; then
+            echo "Fast-forward; no backup needed."
+          else
+            backup="${prefix}$(date -u +%Y-%m-%d)-${TARGET_SHA:0:9}"
+            git push origin "${TARGET_SHA}:refs/heads/${backup}"
+            echo "Old tip kept on ${backup}." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          git push --force-with-lease="refs/heads/${TARGET}:${TARGET_SHA}" origin "${CANDIDATE_SHA}:refs/heads/${TARGET}"
+          echo "Promoted ${CANDIDATE_SHA} to ${TARGET}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          mapfile -t backups < <(git ls-remote --heads origin "${prefix}*" | cut -f2 | sort)
+          if [ "${KEEP}" -ge 1 ] && [ "${#backups[@]}" -gt "${KEEP}" ]; then
+            for ref in "${backups[@]:0:${#backups[@]}-KEEP}"; do
+              git push origin --delete "$ref"
+            done
+          fi
+
+          title="Upstream sync failed: ${TARGET}"
+          number=$(gh issue list --state open --label "$LABEL" --limit 100 --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "Fixed: ${RUN_URL} promoted \`${CANDIDATE_SHA}\` to \`${TARGET}\`."
+          fi
 
       - name: Report the conflict
         if: steps.rebase.outputs.conflict == 'true'
@@ -320,7 +419,7 @@ jobs:
           else
             gh issue create --title "$title" --label "$LABEL" --body-file "$body"
           fi
-          echo "::error title=Upstream sync::The rebase onto upstream conflicted. See the issue: ${title}"
+          echo "::error title=Upstream sync::${TARGET} could not take the upstream changes. See the issue: ${title}"
           exit 1
 
   finish:
@@ -373,11 +472,16 @@ jobs:
           # Backups are dated branches, newest last by name. They keep the old
           # tip reachable, which a range-diff and a bisect both need.
           prefix="backup/${TARGET}-pre-sync-"
-          backup="${prefix}$(date -u +%Y-%m-%d)-${TARGET_SHA:0:9}"
-          git push origin "${TARGET_SHA}:refs/heads/${backup}"
+          if git merge-base --is-ancestor "$TARGET_SHA" "$CANDIDATE_SHA"; then
+            echo "Fast-forward; no backup needed."
+          else
+            backup="${prefix}$(date -u +%Y-%m-%d)-${TARGET_SHA:0:9}"
+            git push origin "${TARGET_SHA}:refs/heads/${backup}"
+            echo "Old tip kept on ${backup}." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
           # The lease fails the push if the target moved since sync read it.
           git push --force-with-lease="refs/heads/${TARGET}:${TARGET_SHA}" origin "${CANDIDATE_SHA}:refs/heads/${TARGET}"
-          echo "Promoted ${CANDIDATE_SHA} to ${TARGET}. Old tip kept on ${backup}." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Promoted ${CANDIDATE_SHA} to ${TARGET}." | tee -a "$GITHUB_STEP_SUMMARY"
 
           mapfile -t backups < <(git ls-remote --heads origin "${prefix}*" | cut -f2 | sort)
           if [ "${KEEP}" -ge 1 ] && [ "${#backups[@]}" -gt "${KEEP}" ]; then
