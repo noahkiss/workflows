@@ -1,0 +1,434 @@
+name: Upstream sync
+
+# Keeps a patch series rebased on top of an upstream branch. The series is every
+# commit on target_branch that is not on the upstream branch; it must sit
+# purely on top of upstream, never merged with it.
+#
+# One file, two modes, called as two jobs of the same caller run with the
+# caller's own build job between them:
+#
+#   sync    Fetch upstream. If it moved, rebase the series onto it, push the
+#           result to candidate_branch and output its SHA. On a conflict, open
+#           or update an issue and fail.
+#   finish  Given the build verdict on the candidate: on success, back up the
+#           old tip and force-push the candidate to target_branch with a lease
+#           on the old tip. On failure, open or update an issue and fail.
+#
+# A reusable workflow cannot take a job as an input, so the build stays in the
+# caller.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: sync or finish.
+        required: true
+        type: string
+      target_branch:
+        description: Branch that carries the patch series.
+        required: false
+        type: string
+        default: main
+      candidate_branch:
+        description: Branch the rebased series is pushed to. Empty means sync/<target_branch>.
+        required: false
+        type: string
+        default: ''
+      issue_label:
+        description: Label on the issue opened when a sync or a build fails.
+        required: false
+        type: string
+        default: upstream-sync
+      # sync mode
+      upstream_url:
+        description: sync only. Clone URL of the upstream repository.
+        required: false
+        type: string
+        default: ''
+      upstream_branch:
+        description: sync only. Upstream branch to rebase onto.
+        required: false
+        type: string
+        default: main
+      candidate_ref:
+        description: >-
+          sync only. Skip the rebase and adopt this origin branch or SHA as the
+          candidate, for example a branch where the conflict was resolved by
+          hand. It must contain the upstream tip.
+        required: false
+        type: string
+        default: ''
+      # finish mode
+      candidate_sha:
+        description: finish only. The candidate the build ran on; the sync output.
+        required: false
+        type: string
+        default: ''
+      target_sha:
+        description: finish only. The target tip the candidate replaces; the sync output.
+        required: false
+        type: string
+        default: ''
+      build_result:
+        description: finish only. The build job's result, as needs.<job>.result.
+        required: false
+        type: string
+        default: ''
+      range_diff:
+        description: finish only. The sync output, quoted in the issue on a red build.
+        required: false
+        type: string
+        default: ''
+      keep_backups:
+        description: finish only. How many backup/<target_branch>-pre-sync-* branches to keep.
+        required: false
+        type: number
+        default: 5
+    secrets:
+      token:
+        description: >-
+          Optional token used for git pushes. Defaults to GITHUB_TOKEN. A token
+          with the workflows permission is needed when the series changes files
+          under .github/workflows, because GITHUB_TOKEN cannot push those.
+        required: false
+    outputs:
+      changed:
+        description: "'true' when upstream moved and a candidate was pushed."
+        value: ${{ jobs.sync.outputs.changed }}
+      candidate_sha:
+        description: SHA of the pushed candidate.
+        value: ${{ jobs.sync.outputs.candidate_sha }}
+      target_sha:
+        description: Target tip the candidate was built from. Pass it to finish.
+        value: ${{ jobs.sync.outputs.target_sha }}
+      old_base:
+        description: Upstream commit the series sat on before the sync.
+        value: ${{ jobs.sync.outputs.old_base }}
+      new_base:
+        description: Upstream tip the candidate sits on.
+        value: ${{ jobs.sync.outputs.new_base }}
+      range_diff:
+        description: git range-diff of the old series against the candidate, truncated.
+        value: ${{ jobs.sync.outputs.range_diff }}
+      range_diff_summary:
+        description: One line, for example "3 patches; 2 unchanged, 1 changed, 0 dropped, 0 added".
+        value: ${{ jobs.sync.outputs.range_diff_summary }}
+
+jobs:
+  check-mode:
+    name: Check mode
+    if: inputs.mode != 'sync' && inputs.mode != 'finish'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject the mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          echo "mode must be sync or finish; got '${MODE}'" >&2
+          exit 1
+
+  sync:
+    name: Sync with upstream
+    if: inputs.mode == 'sync'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: upstream-sync-${{ github.repository }}-${{ inputs.target_branch }}
+      cancel-in-progress: false
+    outputs:
+      changed: ${{ steps.rebase.outputs.changed }}
+      candidate_sha: ${{ steps.rebase.outputs.candidate_sha }}
+      target_sha: ${{ steps.rebase.outputs.target_sha }}
+      old_base: ${{ steps.rebase.outputs.old_base }}
+      new_base: ${{ steps.rebase.outputs.new_base }}
+      range_diff: ${{ steps.rebase.outputs.range_diff }}
+      range_diff_summary: ${{ steps.rebase.outputs.range_diff_summary }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TARGET: ${{ inputs.target_branch }}
+      CANDIDATE: ${{ inputs.candidate_branch || format('sync/{0}', inputs.target_branch) }}
+      LABEL: ${{ inputs.issue_label }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out the target branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.token || github.token }}
+
+      - name: Rebase the series
+        id: rebase
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$UPSTREAM_URL" ]; then
+            echo "upstream_url is required in sync mode." >&2
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898813+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          target_sha=$(git rev-parse HEAD)
+          new_base=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")
+          old_base=$(git merge-base "$target_sha" "$new_base")
+          {
+            echo "target_sha=${target_sha}"
+            echo "old_base=${old_base}"
+            echo "new_base=${new_base}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$CANDIDATE_REF" ]; then
+            git fetch --no-tags origin "$CANDIDATE_REF"
+            candidate=$(git rev-parse FETCH_HEAD)
+            if ! git merge-base --is-ancestor "$new_base" "$candidate"; then
+              echo "candidate_ref ${CANDIDATE_REF} does not contain the upstream tip ${new_base}." >&2
+              exit 1
+            fi
+            echo "Adopting ${CANDIDATE_REF} (${candidate}) as the candidate."
+          elif [ "$old_base" = "$new_base" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream ${UPSTREAM_BRANCH} has not moved since ${new_base}. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          else
+            mapfile -t series < <(git rev-list --reverse "${old_base}..${target_sha}")
+            echo "Rebasing ${#series[@]} patches from ${old_base} onto ${new_base}."
+            git switch --quiet --detach "$target_sha"
+            if ! git rebase --onto "$new_base" "$old_base"; then
+              # Collect what the fixer needs, then leave a clean tree.
+              stopped=$(git rev-parse --verify -q REBASE_HEAD || true)
+              index=0
+              for i in "${!series[@]}"; do
+                if [ "${series[$i]}" = "$stopped" ]; then index=$((i + 1)); fi
+              done
+              mapfile -t files < <(git diff --name-only --diff-filter=U)
+              body="$RUNNER_TEMP/issue.md"
+              {
+                echo "## Rebase conflict"
+                echo
+                echo "- Run: ${RUN_URL}"
+                echo "- Target: \`${TARGET}\` at \`${target_sha}\`"
+                echo "- Upstream: \`${UPSTREAM_URL}\` \`${UPSTREAM_BRANCH}\` moved from \`${old_base}\` to \`${new_base}\` ($(git rev-list --count "${old_base}..${new_base}") commits)"
+                echo "- Conflicting patch ${index} of ${#series[@]}: \`$(git log -1 --format='%h %s' "$stopped")\`"
+                echo "- Conflicted files:"
+                for f in "${files[@]}"; do echo "  - \`${f}\`"; done
+                echo
+                echo "### Series"
+                echo
+                echo '```'
+                git log --reverse --format='%h %s' "${old_base}..${target_sha}"
+                echo '```'
+                echo
+                echo "### Upstream commits that touch the conflicted files"
+                echo
+                echo '```'
+                git log -n 50 --format='%h %s' "${old_base}..${new_base}" -- "${files[@]}"
+                echo '```'
+                echo
+                echo "### Conflict hunks"
+                echo
+                echo '```diff'
+                git diff | head -300 || true
+                echo '```'
+                if [ "$index" -gt 1 ]; then
+                  echo
+                  echo "### Range-diff of the patches that applied"
+                  echo
+                  echo '```'
+                  git range-diff --no-color "${old_base}..${series[$((index - 2))]}" "${new_base}..HEAD" | head -200 || true
+                  echo '```'
+                fi
+                echo
+                echo "### Reproduce"
+                echo
+                echo '```sh'
+                echo "git fetch ${UPSTREAM_URL} ${UPSTREAM_BRANCH}"
+                echo "git rebase --onto ${new_base} ${old_base} ${target_sha}"
+                echo '```'
+                echo
+                echo "Push the resolved series to a branch, then dispatch this sync with \`candidate_ref\` set to it."
+              } > "$body"
+              git rebase --abort
+              {
+                echo "changed=false"
+                echo "conflict=true"
+              } >> "$GITHUB_OUTPUT"
+              cat "$body" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            candidate=$(git rev-parse HEAD)
+          fi
+
+          range_diff=$(git range-diff --no-color "${old_base}..${target_sha}" "${new_base}..${candidate}")
+          summary=$(awk '
+            $3 == "=" { same++ } $3 == "!" { changed++ }
+            $3 == "<" { dropped++ } $3 == ">" { added++ }
+            END { printf "%d patches; %d unchanged, %d changed, %d dropped, %d added",
+                  same + changed + dropped + added, same, changed, dropped, added }' <<< "$range_diff")
+          {
+            echo "changed=true"
+            echo "candidate_sha=${candidate}"
+            echo "range_diff_summary=${summary}"
+            echo 'range_diff<<RANGE_DIFF_EOF'
+            printf '%s\n' "${range_diff:0:20000}"
+            echo 'RANGE_DIFF_EOF'
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Upstream sync"
+            echo
+            echo "Candidate \`${candidate}\` on \`${new_base}\`. ${summary}."
+            echo
+            echo '```'
+            printf '%s\n' "${range_diff:0:20000}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push the candidate
+        if: steps.rebase.outputs.changed == 'true'
+        env:
+          SHA: ${{ steps.rebase.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          # Lease on whatever the candidate branch holds now; empty means absent.
+          current=$(git ls-remote origin "refs/heads/${CANDIDATE}" | cut -f1)
+          git push --force-with-lease="refs/heads/${CANDIDATE}:${current}" origin "${SHA}:refs/heads/${CANDIDATE}"
+          echo "Pushed ${SHA} to ${CANDIDATE}."
+
+      - name: Report the conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        run: |
+          set -euo pipefail
+          title="Upstream sync failed: ${TARGET}"
+          gh label create "$LABEL" --color BFD4F2 --description "Opened by the upstream sync workflow" 2>/dev/null || true
+          number=$(gh issue list --state open --label "$LABEL" --limit 100 --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          body="$RUNNER_TEMP/issue.md"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file "$body"
+          else
+            gh issue create --title "$title" --label "$LABEL" --body-file "$body"
+          fi
+          echo "::error title=Upstream sync::The rebase onto upstream conflicted. See the issue: ${title}"
+          exit 1
+
+  finish:
+    name: Promote or report
+    if: inputs.mode == 'finish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: upstream-sync-${{ github.repository }}-${{ inputs.target_branch }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TARGET: ${{ inputs.target_branch }}
+      CANDIDATE: ${{ inputs.candidate_branch || format('sync/{0}', inputs.target_branch) }}
+      LABEL: ${{ inputs.issue_label }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      TARGET_SHA: ${{ inputs.target_sha }}
+      BUILD_RESULT: ${{ inputs.build_result }}
+    steps:
+      - name: Check the inputs
+        run: |
+          set -euo pipefail
+          for name in CANDIDATE_SHA TARGET_SHA BUILD_RESULT; do
+            if [ -z "${!name}" ]; then
+              echo "${name,,} is required in finish mode." >&2
+              exit 1
+            fi
+          done
+
+      - name: Check out the candidate
+        if: inputs.build_result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 1
+          token: ${{ secrets.token || github.token }}
+
+      - name: Promote the candidate
+        if: inputs.build_result == 'success'
+        env:
+          KEEP: ${{ inputs.keep_backups }}
+        run: |
+          set -euo pipefail
+          # Backups are dated branches, newest last by name. They keep the old
+          # tip reachable, which a range-diff and a bisect both need.
+          prefix="backup/${TARGET}-pre-sync-"
+          backup="${prefix}$(date -u +%Y-%m-%d)-${TARGET_SHA:0:9}"
+          git push origin "${TARGET_SHA}:refs/heads/${backup}"
+          # The lease fails the push if the target moved since sync read it.
+          git push --force-with-lease="refs/heads/${TARGET}:${TARGET_SHA}" origin "${CANDIDATE_SHA}:refs/heads/${TARGET}"
+          echo "Promoted ${CANDIDATE_SHA} to ${TARGET}. Old tip kept on ${backup}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          mapfile -t backups < <(git ls-remote --heads origin "${prefix}*" | cut -f2 | sort)
+          if [ "${KEEP}" -ge 1 ] && [ "${#backups[@]}" -gt "${KEEP}" ]; then
+            for ref in "${backups[@]:0:${#backups[@]}-KEEP}"; do
+              git push origin --delete "$ref"
+            done
+          fi
+
+          title="Upstream sync failed: ${TARGET}"
+          number=$(gh issue list --state open --label "$LABEL" --limit 100 --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "Fixed: ${RUN_URL} promoted \`${CANDIDATE_SHA}\` to \`${TARGET}\`."
+          fi
+
+      - name: Report the build
+        if: inputs.build_result != 'success'
+        env:
+          RANGE_DIFF: ${{ inputs.range_diff }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_RESULT" != failure ]; then
+            echo "::error title=Upstream sync::The build was ${BUILD_RESULT}. ${TARGET} was not changed."
+            exit 1
+          fi
+          title="Upstream sync failed: ${TARGET}"
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "## Build failed on the rebased series"
+            echo
+            echo "- Run: ${RUN_URL}"
+            echo "- Candidate: \`${CANDIDATE}\` at \`${CANDIDATE_SHA}\`"
+            echo "- Target: \`${TARGET}\` at \`${TARGET_SHA}\`, unchanged"
+            echo
+            echo "Read the failed job in the run above. Fix the series on a branch cut from the candidate,"
+            echo "then dispatch this sync with \`candidate_ref\` set to that branch."
+            if [ -n "$RANGE_DIFF" ]; then
+              echo
+              echo "### Range-diff"
+              echo
+              echo '```'
+              printf '%s\n' "$RANGE_DIFF"
+              echo '```'
+            fi
+          } > "$body"
+          gh label create "$LABEL" --color BFD4F2 --description "Opened by the upstream sync workflow" 2>/dev/null || true
+          number=$(gh issue list --state open --label "$LABEL" --limit 100 --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file "$body"
+          else
+            gh issue create --title "$title" --label "$LABEL" --body-file "$body"
+          fi
+          echo "::error title=Upstream sync::The build failed on the candidate. See the issue: ${title}"
+          exit 1
