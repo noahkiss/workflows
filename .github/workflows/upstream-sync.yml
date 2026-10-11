@@ -360,7 +360,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_sha }}
-          fetch-depth: 1
+          # Full history: the backup push needs the old target tip locally.
+          fetch-depth: 0
           token: ${{ secrets.token || github.token }}
 
       - name: Promote the candidate
