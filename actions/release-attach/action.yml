@@ -130,12 +130,15 @@ runs:
       run: |
         set -euo pipefail
         sha="$(git rev-parse HEAD)"
+        # Any green run on this commit counts: a release branch's run passes
+        # before the tag push starts another one on the same commit.
         for _ in $(seq 1 $((TIMEOUT * 2))); do
-          run="$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --limit 1 --json status,conclusion,url --jq '.[0] // empty')"
-          if [ -n "$run" ] && [ "$(jq -r .status <<<"$run")" = completed ]; then
-            conclusion="$(jq -r .conclusion <<<"$run")"
-            [ "$conclusion" = success ] || { echo "::error::${CI_WORKFLOW} on ${sha} ended ${conclusion}: $(jq -r .url <<<"$run")"; exit 1; }
-            echo "CI passed: $(jq -r .url <<<"$run")"; exit 0
+          runs="$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --limit 20 --json status,conclusion,url)"
+          green="$(jq -r '[.[] | select(.conclusion == "success")][0].url // empty' <<<"$runs")"
+          if [ -n "$green" ]; then echo "CI passed: $green"; exit 0; fi
+          open="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+          if [ "$(jq length <<<"$runs")" -gt 0 ] && [ "$open" -eq 0 ]; then
+            echo "::error::every ${CI_WORKFLOW} run on ${sha} ended without success: $(jq -r '.[0].url' <<<"$runs")"; exit 1
           fi
           sleep 30
         done
