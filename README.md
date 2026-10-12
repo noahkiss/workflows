@@ -516,6 +516,8 @@ bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 | `tauri-command` | no | `''` → `<frontend-dir>/node_modules/.bin/tauri` | Tauri CLI command |
 | `brew-packages` | no | `''` | Homebrew packages, space-separated |
 | `check-versions` | no | `true` | Manifest versions must match the tag |
+| `cache-shared-key` | no | `''` → per-job key | rust-cache `shared-key`; see below |
+| `cache-save` | no | `true` | `false` skips saving the Rust cache |
 | `updater-private-key` | no | `''` → not passed | `TAURI_SIGNING_PRIVATE_KEY` for the build, for a config with `createUpdaterArtifacts` |
 | `updater-private-key-password` | no | `''` | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 
@@ -525,6 +527,31 @@ bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 | `version` | The tag without its `v` |
 | `asset` | File name the zip should get |
 | `app` | Path of the built `.app` |
+
+**Rust cache across releases.** GitHub scopes a cache to the ref that saved it,
+plus the default branch. A cache saved under `v1.2.3` is invisible to `v1.2.4`,
+so with the defaults every release compiles all dependencies. To reuse them,
+build the app on the default branch in a job of its own with the same
+`Swatinem/rust-cache` settings and `shared-key`, and pass that key here with
+`cache-save: false`. Keep that job's `CARGO*`/`RUST*`/`CC*` environment and
+Rust toolchain the same as the release job's: rust-cache hashes them into the
+key. rust-cache removes the workspace's own crates before it saves, so the
+released binary always builds from the tag.
+
+```yaml
+# The default-branch job (for example on push to main, or after each release)
+- uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+  with:
+    workspaces: src-tauri
+    shared-key: tauri-release
+- run: app/node_modules/.bin/tauri build --bundles app   # in src-tauri, as the action does
+
+# The release job
+- uses: noahkiss/workflows/actions/tauri-macos-build@<sha>
+  with:
+    cache-shared-key: tauri-release
+    cache-save: 'false'
+```
 
 ### `actions/release-attach`
 
