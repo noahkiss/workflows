@@ -31,11 +31,17 @@ on:
         required: false
         type: string
         default: pytest
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 20
 
 jobs:
   ci:
     name: Python CI
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
     concurrency:

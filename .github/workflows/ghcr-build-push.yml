@@ -2,8 +2,11 @@ name: GHCR build and push
 
 # Container build, pushed to GitHub Container Registry. Builds linux/amd64 by
 # default; pass `platforms` to add linux/arm64 when an ARM host runs the image.
-# The calling job must grant `packages: write`; a called workflow cannot hold
-# more token permission than its caller.
+# `push: false` builds without pushing, for pull requests. `native_runners`
+# builds each platform on its own runner (arm64 on an arm64 runner, no QEMU)
+# and joins the digests into one manifest list.
+# The calling job must grant `packages: write`, with `push: false` too; a
+# called workflow cannot hold more token permission than its caller.
 
 on:
   workflow_call:
@@ -74,18 +77,42 @@ on:
         required: false
         type: string
         default: ''
+      push:
+        description: >-
+          Push the image. false builds every platform and runs the smoke test,
+          then pushes nothing: the pull request mode.
+        required: false
+        type: boolean
+        default: true
+      native_runners:
+        description: >-
+          Build each platform on a runner of its own architecture, in
+          parallel: linux/amd64 on ubuntu-latest, linux/arm64 on
+          ubuntu-24.04-arm. Faster than QEMU emulation for arm64. A merge job
+          then pushes one manifest list with the tags. false builds every
+          platform on one amd64 runner under QEMU.
+        required: false
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: Timeout in minutes of each build job.
+        required: false
+        type: number
+        default: 45
     outputs:
       digest:
-        description: Digest of the pushed image.
-        value: ${{ jobs.build.outputs.digest }}
+        description: Digest of the pushed image (the manifest list with native_runners). Empty when push is false.
+        value: ${{ jobs.build.outputs.digest || jobs.merge.outputs.digest }}
       tags:
         description: Tags docker/metadata-action produced, one per line.
-        value: ${{ jobs.build.outputs.tags }}
+        value: ${{ jobs.build.outputs.tags || jobs.merge.outputs.tags }}
 
 jobs:
   build:
     name: Build and push
+    if: ${{ !inputs.native_runners }}
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions:
       contents: read
       packages: write
@@ -126,6 +153,7 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
+        if: inputs.push
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -168,7 +196,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
-          push: true
+          push: ${{ inputs.push }}
           build-args: ${{ inputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -180,10 +208,241 @@ jobs:
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
+          PUSHED: ${{ inputs.push }}
         run: |
           set -euo pipefail
           {
-            echo "### Pushed image"
+            if [ "$PUSHED" = true ]; then
+              echo "### Pushed image"
+              echo
+              echo "Digest: \`${DIGEST}\`"
+            else
+              echo "### Built image, not pushed"
+              echo
+              echo "Tags it would get:"
+            fi
+            echo
+            echo '```'
+            printf '%s\n' "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # native_runners: plan -> one build per platform on its own runner -> merge.
+  plan:
+    name: Plan the platform builds
+    if: inputs.native_runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      key: ${{ steps.plan.outputs.key }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Map each platform to a runner
+        id: plan
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          REPOSITORY: ${{ github.repository }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_INPUT:-ghcr.io/${REPOSITORY}}"
+          image=$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')
+          matrix='[]'
+          IFS=, read -ra list <<< "$PLATFORMS"
+          for platform in "${list[@]}"; do
+            platform="${platform//[[:space:]]/}"
+            [ -n "$platform" ] || continue
+            case "$platform" in
+              linux/amd64) runner=ubuntu-latest ;;
+              linux/arm64|linux/arm64/v8) runner=ubuntu-24.04-arm ;;
+              *)
+                echo "::error::no native runner for ${platform}; set native_runners: false to build it under QEMU"
+                exit 1 ;;
+            esac
+            matrix=$(jq -c --arg p "$platform" --arg r "$runner" --arg s "${platform//\//-}" \
+              '. + [{platform: $p, runner: $r, slug: $s}]' <<< "$matrix")
+          done
+          [ "$matrix" != '[]' ] || { echo "::error::platforms is empty"; exit 1; }
+          # Artifact names must be unique in the caller's run, which may build
+          # several images; the key ties the digests to this image.
+          key=$(printf '%s' "$image" | sha256sum | cut -c1-12)
+          {
+            echo "image=${image}"
+            echo "key=${key}"
+            echo "matrix=${matrix}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image: ${image}"
+          echo "Builds: ${matrix}"
+
+  native:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    concurrency:
+      group: ghcr-build-push-${{ github.repository }}-${{ inputs.image }}-${{ matrix.platform }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ needs.plan.outputs.image }}
+          labels: ${{ inputs.labels }}
+
+      # Each platform runs the smoke test on its own architecture.
+      - name: Build the image for the smoke test
+        if: inputs.smoke_command != ''
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          load: true
+          build-args: ${{ inputs.build_args }}
+          push: false
+          tags: ${{ needs.plan.outputs.image }}:smoke
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+
+      - name: Run the smoke test
+        if: inputs.smoke_command != ''
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}:smoke
+          SMOKE_COMMAND: ${{ inputs.smoke_command }}
+        run: bash -euo pipefail -c "$SMOKE_COMMAND"
+
+      # Pushed by digest only. The merge job gives the tags, once every
+      # platform has built.
+      - name: Build
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build_args }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: >-
+            ${{ inputs.push
+            && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.plan.outputs.image)
+            || 'type=cacheonly' }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+
+      - name: Keep the digest
+        if: inputs.push
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        if: inputs.push
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ needs.plan.outputs.key }}-${{ matrix.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Push the manifest list
+    needs: [plan, native]
+    if: inputs.native_runners && inputs.push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-build-push-merge-${{ github.repository }}-${{ inputs.image }}-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ needs.plan.outputs.key }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and annotations
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ needs.plan.outputs.image }}
+          tags: ${{ inputs.tags }}
+          labels: ${{ inputs.labels }}
+
+      - name: Create and push the manifest list
+        id: push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          METADATA: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$METADATA")
+          while IFS= read -r note; do args+=(--annotation "$note"); done < <(jq -r '.annotations[]' <<< "$METADATA")
+          [ "${#args[@]}" -gt 0 ] || { echo "::error::the tag rules produced no tags"; exit 1; }
+          refs=()
+          for digest in *; do refs+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${args[@]}" "${refs[@]}"
+          first=$(jq -r '.tags[0]' <<< "$METADATA")
+          digest=$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Pushed manifest list"
             echo
             echo "Digest: \`${DIGEST}\`"
             echo

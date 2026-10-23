@@ -1,7 +1,9 @@
 name: Cloudflare Pages deploy
 
-# Builds the site with npm, then publishes the output directory to a
-# Cloudflare Pages project with wrangler.
+# Builds the site with npm or pnpm, then publishes the output directory to a
+# Cloudflare Pages project with wrangler. Set `wrangler-version` to pin
+# wrangler: the deploy then runs it with npx, outside the site's own
+# dependency tree, so the site's peer ranges cannot refuse it.
 
 on:
   workflow_call:
@@ -19,11 +21,34 @@ on:
         required: false
         type: string
         default: .
-      build-command:
-        description: Command that produces the output directory.
+      package-manager:
+        description: >-
+          auto, npm or pnpm. auto picks pnpm when pnpm-lock.yaml sits in
+          working-directory, otherwise npm.
         required: false
         type: string
-        default: npm run build
+        default: auto
+      build-command:
+        description: >-
+          Command that produces the output directory. Empty means
+          `<package manager> run build`.
+        required: false
+        type: string
+        default: ''
+      wrangler-version:
+        description: >-
+          wrangler version or range to deploy with, e.g. 3 or 4.45.0. Empty
+          keeps cloudflare/wrangler-action's own choice, which installs
+          wrangler into working-directory and can fail on the site's peer
+          dependency ranges.
+        required: false
+        type: string
+        default: ''
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 15
       node-version-file:
         description: File holding the Node version, relative to working-directory.
         required: false
@@ -41,6 +66,7 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.project }}
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
     concurrency:
@@ -56,10 +82,21 @@ jobs:
       - name: Resolve paths
         id: paths
         env:
+          REQUESTED: ${{ inputs.package-manager }}
           WORKING_DIRECTORY: ${{ inputs.working-directory }}
           VERSION_FILE: ${{ inputs.node-version-file }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
         run: |
           set -euo pipefail
+
+          manager="$REQUESTED"
+          if [ "$manager" = auto ]; then
+            if [ -f pnpm-lock.yaml ]; then manager=pnpm; else manager=npm; fi
+          fi
+          case "$manager" in
+            npm|pnpm) ;;
+            *) echo "package-manager must be auto, npm or pnpm; got '${manager}'" >&2; exit 1 ;;
+          esac
 
           # setup-node resolves its paths from the repository root, not from
           # this step's working directory.
@@ -73,30 +110,67 @@ jobs:
             exit 1
           fi
 
+          if [ "$manager" = pnpm ]; then lockfile=pnpm-lock.yaml; else lockfile=package-lock.json; fi
+          build="$BUILD_COMMAND"
+          [ -n "${build//[[:space:]]/}" ] || build="${manager} run build"
+
           {
+            echo "manager=${manager}"
             echo "version_file=${prefix}${VERSION_FILE}"
-            echo "lock_path=${prefix}package-lock.json"
+            echo "lock_path=${prefix}${lockfile}"
+            echo "package_json=${prefix}package.json"
+            echo "build<<__BUILD__"
+            printf '%s\n' "$build"
+            echo "__BUILD__"
           } >> "$GITHUB_OUTPUT"
+          echo "Package manager: ${manager}"
+
+      - name: Set up pnpm
+        if: steps.paths.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: ${{ steps.paths.outputs.package_json }}
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ${{ steps.paths.outputs.version_file }}
-          cache: npm
+          cache: ${{ steps.paths.outputs.manager }}
           cache-dependency-path: ${{ steps.paths.outputs.lock_path }}
 
       - name: Install dependencies
-        run: npm ci
+        env:
+          MANAGER: ${{ steps.paths.outputs.manager }}
+        run: |
+          set -euo pipefail
+          if [ "$MANAGER" = pnpm ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
 
       - name: Build
         env:
-          BUILD_COMMAND: ${{ inputs.build-command }}
+          BUILD_COMMAND: ${{ steps.paths.outputs.build }}
         run: bash -euo pipefail -c "$BUILD_COMMAND"
 
       - name: Publish to Cloudflare Pages
+        if: inputs.wrangler-version == ''
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.cloudflare_api_token }}
           accountId: ${{ secrets.cloudflare_account_id }}
           workingDirectory: ${{ inputs.working-directory }}
           command: pages deploy ${{ inputs.directory }} --project-name=${{ inputs.project }}
+
+      # npx runs the pinned wrangler from its own cache. Nothing is added to the
+      # site's node_modules, so the site's peer dependency ranges do not apply.
+      - name: Publish to Cloudflare Pages (pinned wrangler)
+        if: inputs.wrangler-version != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare_api_token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.cloudflare_account_id }}
+          WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+          DIRECTORY: ${{ inputs.directory }}
+          PROJECT: ${{ inputs.project }}
+        run: npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy "$DIRECTORY" --project-name="$PROJECT"

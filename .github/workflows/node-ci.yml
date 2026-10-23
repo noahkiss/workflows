@@ -1,7 +1,9 @@
 name: Node CI
 
 # Installs dependencies with the detected package manager, then runs the named
-# package scripts in order. Optionally gates on `npm audit`.
+# package scripts in order. Optionally gates on `npm audit`. `services` starts
+# service containers (a database, a cache) beside the job, and `env` and
+# `env_secrets` set environment variables for the scripts.
 
 on:
   workflow_call:
@@ -40,13 +42,45 @@ on:
         required: false
         type: boolean
         default: false
+      services:
+        description: >-
+          Service containers as a JSON object, in the shape of a job's
+          `services:` map, e.g.
+          {"postgres": {"image": "postgres:17", "env": {"POSTGRES_PASSWORD":
+          "postgres"}, "ports": ["5432:5432"], "options": "--health-cmd
+          pg_isready --health-interval 5s --health-retries 10"}}. The job runs
+          on the runner, so a script reaches a service at localhost on its
+          mapped port. Empty starts none.
+        required: false
+        type: string
+        default: ''
+      env:
+        description: >-
+          Environment variables for install and the scripts, one KEY=value
+          per line. Not for secrets: use env_secrets.
+        required: false
+        type: string
+        default: ''
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 20
+    secrets:
+      env_secrets:
+        description: >-
+          Secret environment variables for install and the scripts, one
+          KEY=value per line. Each value is masked in the log.
+        required: false
 
 jobs:
   ci:
     name: Node CI
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
+    services: ${{ fromJSON(inputs.services || '{}') }}
     concurrency:
       group: node-ci-${{ github.repository }}-${{ inputs.working-directory }}-${{ github.ref }}
       cancel-in-progress: true
@@ -56,6 +90,37 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set environment
+        env:
+          PLAIN: ${{ inputs.env }}
+          SECRET: ${{ secrets.env_secrets }}
+        run: |
+          set -euo pipefail
+          # Each line is KEY=value. A random delimiter keeps a value from
+          # ending the GITHUB_ENV block early.
+          add() {
+            local masked="$1" line key value delim n=0
+            while IFS= read -r line; do
+              n=$((n + 1))
+              line="${line%$'\r'}"
+              [ -n "${line//[[:space:]]/}" ] || continue
+              key="${line%%=*}"
+              value="${line#*=}"
+              key="${key//[[:space:]]/}"
+              if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                # The line itself is not printed: it may hold a secret.
+                echo "::error::line ${n} of $2 is not KEY=value"
+                exit 1
+              fi
+              if [ "$masked" = 1 ] && [ -n "$value" ]; then echo "::add-mask::${value}"; fi
+              delim="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+              echo "Set ${key}"
+            done
+          }
+          add 0 env <<< "$PLAIN"
+          add 1 env_secrets <<< "$SECRET"
 
       - name: Detect package manager
         id: pm

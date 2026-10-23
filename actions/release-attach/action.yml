@@ -4,8 +4,9 @@ description: >-
   with ditto, wait for a green CI run on the checked-out commit, and attach the
   zip to a tag's GitHub Release. Never replaces an asset that is already
   attached. With `updater: true` it also attaches a Tauri updater archive of
-  the same bundle, its signature and a latest.json. Needs `contents: write`
-  (and `actions: read` for the CI wait).
+  the same bundle, its signature and a latest.json. `upload: false` makes
+  and checks every file without the CI wait or the upload, for a dry run.
+  Needs `contents: write` (and `actions: read` for the CI wait).
 
 inputs:
   path:
@@ -17,6 +18,13 @@ inputs:
   asset:
     description: File name of the zip, e.g. myapp-1.2.3-arm64.zip.
     required: true
+  upload:
+    description: >-
+      'false': make and check the zip and the updater files, skip the CI wait,
+      attach nothing. The files stay in the workspace (zip) and RUNNER_TEMP
+      (updater archive, .sig, latest.json); the outputs give their paths.
+    required: false
+    default: 'true'
   smoke-command:
     description: Command run against the bundle before it is zipped. $APP holds its path.
     required: false
@@ -68,6 +76,9 @@ outputs:
   updater-archive:
     description: File name of the updater archive, when `updater` is true.
     value: ${{ steps.updater.outputs.archive }}
+  updater-dir:
+    description: Folder holding the updater archive, its .sig and (without upload) latest.json, when `updater` is true.
+    value: ${{ steps.updater.outputs.dir }}
 
 runs:
   using: composite
@@ -114,13 +125,16 @@ runs:
         [[ "$tauri" == /* ]] || tauri="$GITHUB_WORKSPACE/$tauri"
         APP="$APP" OUT="$RUNNER_TEMP/$archive" VERSION="${TAG#v}" TAURI="$tauri" \
           "$GITHUB_ACTION_PATH/updater-archive.sh"
-        echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+        {
+          echo "archive=${archive}"
+          echo "dir=${RUNNER_TEMP}"
+        } >> "$GITHUB_OUTPUT"
 
     # Callers usually run their tests on every push. The release waits for
     # that run on the tagged commit instead of repeating it. The check sits
     # after the build, so the two overlap, and before anything is attached.
     - name: Require a green CI run on the tagged commit
-      if: inputs.require-ci-workflow != ''
+      if: inputs.require-ci-workflow != '' && inputs.upload != 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
@@ -145,6 +159,7 @@ runs:
         echo "::error::no finished ${CI_WORKFLOW} run on ${sha} after ${TIMEOUT} minutes"; exit 1
 
     - name: Attach to the release
+      if: inputs.upload != 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
@@ -167,7 +182,7 @@ runs:
     # names the archive that is attached, with that archive's signature, so a re-run
     # repairs a missing or stale latest.json without breaking an installed app's update.
     - name: Attach the updater files
-      if: inputs.updater == 'true'
+      if: inputs.updater == 'true' && inputs.upload != 'false'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
@@ -204,3 +219,34 @@ runs:
           > "$RUNNER_TEMP/latest.json"
         jq -e '.platforms[].signature | length > 0' "$RUNNER_TEMP/latest.json" >/dev/null
         gh release upload "$TAG" "$RUNNER_TEMP/latest.json" --clobber
+
+    # The dry-run twin of the step above: the same latest.json from the archive made
+    # here, written next to it, never uploaded. The notes are a placeholder when no
+    # release exists yet.
+    - name: Write latest.json without uploading
+      if: inputs.updater == 'true' && inputs.upload == 'false'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag }}
+        ARCHIVE: ${{ steps.updater.outputs.archive }}
+        TARGET: ${{ inputs.updater-target }}
+        RELEASE_NOTES: ${{ inputs.updater-notes }}
+      run: |
+        set -euo pipefail
+        made="$RUNNER_TEMP/$ARCHIVE"
+        notes="$RELEASE_NOTES"
+        [ -n "$notes" ] || notes="$(gh release view "$TAG" --json body --jq .body 2>/dev/null || echo "Dry run of ${TAG}")"
+        jq -n \
+          --arg version "${TAG#v}" \
+          --arg notes "$notes" \
+          --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg target "$TARGET" \
+          --arg signature "$(cat "$made.sig")" \
+          --arg url "https://github.com/${GH_REPO}/releases/download/${TAG}/${ARCHIVE}" \
+          '{version: $version, notes: $notes, pub_date: $pub_date,
+            platforms: {($target): {signature: $signature, url: $url}}}' \
+          > "$RUNNER_TEMP/latest.json"
+        jq -e '.platforms[].signature | length > 0' "$RUNNER_TEMP/latest.json" >/dev/null
+        echo "::notice::upload is false: nothing attached; files in ${RUNNER_TEMP}"

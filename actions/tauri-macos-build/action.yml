@@ -5,11 +5,29 @@ description: >-
   Cargo.toml and tauri.conf.json state the tag's version, installs Rust, any
   Homebrew packages, pnpm and Node, builds the .app, and checks the bundle's
   CFBundleShortVersionString. Sign the result with macos-sign-notarize and
-  publish it with release-attach.
+  publish it with release-attach. `require-tag: false` allows a dry run on a
+  branch, and `tauri-args` passes extra arguments to `tauri build`.
 
 inputs:
   tag:
-    description: Release tag, e.g. v1.2.3. Empty means the tag that triggered the run.
+    description: >-
+      Release tag, e.g. v1.2.3. Empty means the tag that triggered the run, or
+      with require-tag false on a branch, v<tauri.conf.json version>.
+    required: false
+    default: ''
+  require-tag:
+    description: >-
+      'true' fails unless HEAD is the commit of a release tag. 'false' is for
+      a dry run: the tag need not exist and HEAD is not checked against it.
+      Never attach the result of a run with 'false'.
+    required: false
+    default: 'true'
+  tauri-args:
+    description: >-
+      Extra arguments for `tauri build`, one per line, added after
+      `--bundles app`; e.g. `--config` and a path on the next line. A line is
+      one argument, so a JSON value needs no quoting. The build runs in
+      tauri-dir, so a relative path starts there.
     required: false
     default: ''
   app-name:
@@ -97,22 +115,31 @@ runs:
       env:
         INPUT_TAG: ${{ inputs.tag }}
         PREFIX: ${{ inputs.asset-prefix }}
+        REQUIRE_TAG: ${{ inputs.require-tag }}
+        TAURI_DIR: ${{ inputs.tauri-dir }}
       run: |
         set -euo pipefail
         [ "$RUNNER_OS" = macOS ] || { echo "::error::tauri-macos-build needs a macOS runner"; exit 1; }
         tag="${INPUT_TAG:-}"
-        if [ -z "$tag" ]; then
-          [[ "$GITHUB_REF" == refs/tags/* ]] || { echo "::error::no tag input and ${GITHUB_REF} is not a tag"; exit 1; }
+        if [ -z "$tag" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
           tag="${GITHUB_REF#refs/tags/}"
+        fi
+        if [ -z "$tag" ]; then
+          [ "$REQUIRE_TAG" = false ] || { echo "::error::no tag input and ${GITHUB_REF} is not a tag"; exit 1; }
+          tag="v$(jq -r .version "${TAURI_DIR}/tauri.conf.json")"
         fi
         [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] \
           || { echo "::error::not a release tag: ${tag}"; exit 1; }
-        git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null \
-          || git fetch --no-tags --depth=1 origin "+refs/tags/${tag}:refs/tags/${tag}"
-        tag_sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
-        head_sha="$(git rev-parse HEAD)"
-        [ "$tag_sha" = "$head_sha" ] \
-          || { echo "::error::HEAD is ${head_sha}, ${tag} is ${tag_sha}; check out the tag (actions/checkout ref: the tag)"; exit 1; }
+        if [ "$REQUIRE_TAG" = false ]; then
+          echo "::notice::require-tag is false: building ${tag} from $(git rev-parse --short HEAD) without checking the tag"
+        else
+          git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null \
+            || git fetch --no-tags --depth=1 origin "+refs/tags/${tag}:refs/tags/${tag}"
+          tag_sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          [ "$tag_sha" = "$head_sha" ] \
+            || { echo "::error::HEAD is ${head_sha}, ${tag} is ${tag_sha}; check out the tag (actions/checkout ref: the tag)"; exit 1; }
+        fi
         version="${tag#v}"
         {
           echo "tag=${tag}"
@@ -186,6 +213,7 @@ runs:
         FRONTEND_DIR: ${{ inputs.frontend-dir }}
         UPDATER_KEY: ${{ inputs.updater-private-key }}
         UPDATER_KEY_PASSWORD: ${{ inputs.updater-private-key-password }}
+        TAURI_ARGS: ${{ inputs.tauri-args }}
       run: |
         set -euo pipefail
         if [ -n "$UPDATER_KEY" ]; then
@@ -196,7 +224,12 @@ runs:
         cmd="$TAURI_COMMAND"
         [ -n "$cmd" ] || cmd="$GITHUB_WORKSPACE/$FRONTEND_DIR/node_modules/.bin/tauri"
         read -ra tauri <<<"$cmd"
-        "${tauri[@]}" build --bundles app
+        extra=()
+        while IFS= read -r arg; do
+          arg="${arg%$'\r'}"
+          if [ -n "$arg" ]; then extra+=("$arg"); fi
+        done <<<"$TAURI_ARGS"
+        "${tauri[@]}" build --bundles app ${extra[@]+"${extra[@]}"}
 
     - name: Locate the bundle
       id: bundle
