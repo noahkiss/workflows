@@ -8,10 +8,11 @@ Call one by reference:
 uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 ```
 
-Every workflow runs on `ubuntu-latest`. The macOS composite actions
-(`tauri-macos-build`, `macos-sign-notarize`, `release-attach`) need a macOS
-runner. macOS minutes are free for public repositories and metered at 10x for
-private ones.
+Every workflow runs on `ubuntu-latest`, with two exceptions: `rust-ci` takes a
+`runner` input, and `ghcr-build-push` with `native_runners` builds arm64 on
+`ubuntu-24.04-arm`. The macOS composite actions (`tauri-macos-build`,
+`macos-sign-notarize`, `release-attach`) need a macOS runner. macOS minutes are
+free for public repositories and metered at 10x for private ones.
 
 Composite actions live under `actions/`. Call one from a step:
 
@@ -70,6 +71,47 @@ The docs warn:
 
 If you add a guard in your calling job, give it a different group name from the
 one used here.
+
+**Every job has a timeout.** Each workflow takes a `timeout-minutes` input
+(`timeout_minutes` in the snake_case workflows) with a default sized for the
+job. A job that hangs then stops in minutes, not after GitHub's six hours.
+`dispatch-and-wait` and `upstream-sync` bound themselves already. A composite
+action cannot set a timeout: put `timeout-minutes` on the caller's job.
+
+## Saving CI minutes and time
+
+What a caller does so that CI spends minutes only on runs that test something.
+The workflows here cover the job; these lines go in the caller's workflow file.
+
+```yaml
+on:
+  push:
+    branches: [main]
+    # Docs test nothing. Tag pushes ignore path filters. Keep any file the
+    # build bundles (images, fonts) out of this list.
+    paths-ignore: ['**/*.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
+
+# A newer push to the same branch or pull request cancels the older run.
+# Never cancel a deploy or a release half way: keep main and tags uncancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+```
+
+- **One full run per change.** Run the full suite on the pull request. Then a
+  push to main after the merge needs only a fast check; a direct push to main
+  with no pull request runs the full suite.
+- **macOS only where macOS is needed:** signing, notarizing, bundling. A
+  private repository pays 10x for a macOS minute.
+- **Releases and slow suites** run on tags, a schedule or `workflow_dispatch`,
+  never on every push.
+- **Caches** key on the lockfile: `setup-node` (npm, pnpm), `setup-uv`,
+  `rust-cache` and the `gha` buildx cache are on in every workflow here.
+  `rust-ci` saves its cache from the default branch only; branches restore it.
+- **Pull requests build, they do not push:** `ghcr-build-push` with
+  `push: false`.
 
 ---
 
@@ -158,6 +200,9 @@ Replaces the near-identical GHCR build in ten repositories. It builds
 | `dockerfile` | no | `''` → buildx default | Dockerfile path |
 | `build_args` | no | `''` | Build arguments for both builds, one `KEY=value` per line |
 | `smoke_command` | no | `''` → skipped | Command run against a pre-push build |
+| `push` | no | `true` | `false` builds and smoke-tests every platform, pushes nothing |
+| `native_runners` | no | `false` | Build each platform on its own runner; see below |
+| `timeout_minutes` | no | `45` | Timeout of each build job |
 
 Default `tags`:
 
@@ -172,10 +217,11 @@ Secrets: none. It logs in with `github.actor` and the job's `GITHUB_TOKEN`.
 
 | Output | Meaning |
 |---|---|
-| `digest` | Digest of the pushed image |
+| `digest` | Digest of the pushed image; empty with `push: false` |
 | `tags` | Tags that were applied, one per line |
 
-Permissions the calling job must grant:
+Permissions the calling job must grant, with `push: false` too (the called job
+declares them, and a called job cannot exceed its caller):
 
 ```yaml
 permissions:
@@ -219,6 +265,45 @@ jobs:
       packages: write
     with:
       smoke_command: docker run --rm "$IMAGE" python -c "import myapp"
+```
+
+### Pull requests: `push: false`
+
+One job serves both events. A pull request builds every platform and runs the
+smoke test, then pushes nothing; a push to main or a tag pushes:
+
+```yaml
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  image:
+    uses: noahkiss/workflows/.github/workflows/ghcr-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+```
+
+### `native_runners`
+
+QEMU emulates arm64 on an amd64 runner, often five to ten times slower than
+native. With `native_runners: true` each platform builds in parallel on a
+runner of its own architecture (`linux/amd64` on `ubuntu-latest`,
+`linux/arm64` on `ubuntu-24.04-arm`) and pushes by digest. A merge job then
+pushes one manifest list with the tags and the index annotations. Any other
+platform fails the plan job; build it with `native_runners: false`. Each
+platform keeps its own `gha` cache scope, and `smoke_command` runs on every
+platform's own runner before its push.
+
+```yaml
+    with:
+      platforms: linux/amd64,linux/arm64
+      native_runners: true
 ```
 
 ### Building from a `workflow_run` event
@@ -269,8 +354,13 @@ lockfile, then runs the named package scripts in order.
 | `working-directory` | no | `.` | Directory holding `package.json` |
 | `scripts` | no | `test` | Script names, one per line, run in order |
 | `audit` | no | `false` | Gate on `npm audit --omit=dev --audit-level=high` |
+| `services` | no | `''` → none | Service containers, a JSON object in the shape of a job's `services:` |
+| `env` | no | `''` | Environment for install and the scripts, one `KEY=value` per line |
+| `timeout-minutes` | no | `20` | Job timeout |
 
-Secrets: none.
+| Secret | Required | Meaning |
+|---|---|---|
+| `env_secrets` | no | Secret environment, one `KEY=value` per line; values are masked |
 
 Permissions the calling job must grant:
 
@@ -305,6 +395,23 @@ jobs:
       audit: true
 ```
 
+**A database for the tests.** The job runs on the runner, not in a container,
+so a script reaches a service at `localhost` on its mapped port:
+
+```yaml
+    with:
+      scripts: test
+      services: >-
+        {"postgres": {"image": "postgres:17",
+        "env": {"POSTGRES_HOST_AUTH_METHOD": "trust"}, "ports": ["5432:5432"],
+        "options": "--health-cmd pg_isready --health-interval 5s --health-retries 10"}}
+      env: |
+        DATABASE_URL=postgres://postgres@localhost:5432/postgres
+    secrets:
+      env_secrets: |
+        API_KEY=${{ secrets.API_KEY }}
+```
+
 ---
 
 ## `python-ci.yml`
@@ -319,6 +426,7 @@ runs the given commands in order under `uv run`.
 | `working-directory` | no | `.` | Directory holding `pyproject.toml` |
 | `install` | no | `uv sync --frozen` | Install command; empty skips the step |
 | `commands` | no | `pytest` | Commands run under `uv run`, one per line, in order |
+| `timeout-minutes` | no | `20` | Job timeout |
 
 Secrets: none.
 
@@ -356,6 +464,53 @@ jobs:
       commands: |
         ruff check .
         pytest
+```
+
+---
+
+## `rust-ci.yml`
+
+The shared Rust gate for a Cargo workspace: optional `cargo fmt --check`, then
+clippy and the tests, with `Swatinem/rust-cache`.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `working-directory` | no | `.` | Directory holding the workspace's `Cargo.toml` |
+| `runner` | no | `ubuntu-latest` | Runner label; `macos-26` only for a crate that builds on macOS alone |
+| `toolchain` | no | `''` → `rust-toolchain.toml`, else `stable` | Toolchain to install |
+| `fmt` | no | `false` | Run `cargo fmt --all --check` first |
+| `clippy` | no | `true` | Run clippy |
+| `clippy-args` | no | `--all-targets --locked -- -D warnings` | Arguments after `cargo clippy` |
+| `test` | no | `true` | Run the tests |
+| `test-args` | no | `--locked` | Arguments after `cargo test` |
+| `system-packages` | no | `''` | apt packages on Linux, Homebrew packages on macOS, space-separated |
+| `env` | no | `''` | Environment for every cargo command, one `KEY=value` per line |
+| `cache-save` | no | `default-branch` | When to save the Rust cache: `default-branch`, `always`, `never` |
+| `timeout-minutes` | no | `30` | Job timeout |
+
+Secrets: none.
+
+Permissions the calling job must grant:
+
+```yaml
+permissions:
+  contents: read
+```
+
+Saving the cache takes time and cache space, and a branch's cache helps only
+that branch. So by default only the default branch saves; pull requests and
+other branches restore the default branch's cache.
+
+```yaml
+jobs:
+  rust:
+    uses: noahkiss/workflows/.github/workflows/rust-ci.yml@main
+    permissions:
+      contents: read
+    with:
+      working-directory: src-tauri
+      fmt: true
+      system-packages: libudev-dev pkg-config
 ```
 
 ---
@@ -435,8 +590,11 @@ Replaces three inconsistent Cloudflare Pages deploys.
 | `project` | yes | — | Cloudflare Pages project name |
 | `directory` | yes | — | Build output directory, relative to `working-directory` |
 | `working-directory` | no | `.` | Directory holding `package.json` |
-| `build-command` | no | `npm run build` | Command that produces the output |
+| `package-manager` | no | `auto` | `auto`, `npm` or `pnpm`; `auto` picks pnpm when `pnpm-lock.yaml` exists |
+| `build-command` | no | `''` → `<manager> run build` | Command that produces the output |
 | `node-version-file` | no | `.node-version` | Version file, relative to `working-directory` |
+| `wrangler-version` | no | `''` → wrangler-action's choice | Pin wrangler, e.g. `3`; see below |
+| `timeout-minutes` | no | `15` | Job timeout |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -450,8 +608,16 @@ permissions:
   contents: read
 ```
 
-Steps: checkout, `setup-node` with npm cache, `npm ci`, build, then
+Steps: checkout, pnpm when needed, `setup-node` with the manager's cache,
+`npm ci` or `pnpm install --frozen-lockfile`, build, then
 `wrangler pages deploy <directory> --project-name=<project>`.
+
+**Pin wrangler with `wrangler-version`.** Without it,
+`cloudflare/wrangler-action` installs its own wrangler into
+`working-directory` with npm, and npm can refuse it on a peer range the site
+already has (wrangler 4 against the site's `@cloudflare/workers-types`). With
+it, the deploy runs `npx --yes wrangler@<version>`: npx keeps that wrangler in
+its own cache, outside the site's dependency tree.
 
 ```yaml
 jobs:
@@ -462,6 +628,7 @@ jobs:
     with:
       project: my-site
       directory: dist
+      wrangler-version: '3'
     secrets:
       cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -507,6 +674,8 @@ bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 | Input | Required | Default | Meaning |
 |---|---|---|---|
 | `tag` | no | `''` → the triggering tag | Release tag, `vX.Y.Z` |
+| `require-tag` | no | `true` | `false`: a dry run; no tag needed, `HEAD` not checked |
+| `tauri-args` | no | `''` | Extra `tauri build` arguments, one per line |
 | `app-name` | yes | — | Bundle name without `.app` (`productName`) |
 | `asset-prefix` | yes | — | The zip is `<asset-prefix>-<version>-arm64.zip` |
 | `tauri-dir` | no | `src-tauri` | Folder with `tauri.conf.json` and `Cargo.toml` |
@@ -527,6 +696,21 @@ bundle's `CFBundleShortVersionString`. The caller checks out the tag first.
 | `version` | The tag without its `v` |
 | `asset` | File name the zip should get |
 | `app` | Path of the built `.app` |
+
+**Dry run on a branch.** `require-tag: 'false'` builds without a release tag.
+The tag is the `tag` input, else the triggering tag, else
+`v<tauri.conf.json version>`, and `HEAD` is not checked against it. Pair it
+with `release-attach`'s `upload: 'false'`, so nothing from the run is
+published.
+
+**Extra build arguments.** `tauri-args` takes one argument per line, so a
+config overlay needs no quoting. The build runs in `tauri-dir`:
+
+```yaml
+    tauri-args: |
+      --config
+      tauri.bundle.conf.json
+```
 
 **Rust cache across releases.** GitHub scopes a cache to the ref that saved it,
 plus the default branch. A cache saved under `v1.2.3` is invisible to `v1.2.4`,
@@ -567,6 +751,7 @@ missing, attach.
 | `smoke-command` | no | `''` | Run against the bundle; `$APP` holds its path |
 | `require-ci-workflow` | no | `''` → skipped | Workflow file that must be green on `HEAD` |
 | `ci-timeout-minutes` | no | `40` | How long to wait for it |
+| `upload` | no | `true` | `false`: make and check every file, skip the CI wait, attach nothing |
 | `token` | no | `github.token` | Token for `gh` |
 | `updater` | no | `false` | `true`: also attach the updater archive, its `.sig` and `latest.json` |
 | `updater-private-key` | with `updater` | `''` | The updater key, from a secret |
@@ -580,6 +765,21 @@ missing, attach.
 | `asset-path` | Absolute path of the zip |
 | `sha256` | SHA-256 of the zip that was built |
 | `updater-archive` | File name of the updater archive |
+| `updater-dir` | Folder with the updater archive, its `.sig` and, with `upload: false`, `latest.json` |
+
+**Dry run.** With `upload: 'false'` every check and file is made as for a
+release: codesign, the smoke command, the zip and, with `updater`, the signed
+archive and `latest.json`. The CI wait and every upload are skipped. Keep the
+files with `actions/upload-artifact` from `asset-path` and `updater-dir`.
+
+```yaml
+      - uses: noahkiss/workflows/actions/release-attach@main
+        with:
+          path: ${{ steps.build.outputs.app }}
+          tag: ${{ steps.build.outputs.tag }}
+          asset: ${{ steps.build.outputs.asset }}
+          upload: ${{ inputs.dry-run && 'false' || 'true' }}
+```
 
 **Never clobber.** If the tag's release already has the zip, the step keeps it
 and succeeds. A cask pins the sha256 of what was published first, and a rebuilt
@@ -633,6 +833,7 @@ jobs:
   release:
     runs-on: macos-26
     environment: release
+    timeout-minutes: 90
     permissions:
       contents: write
       actions: read

@@ -1,0 +1,191 @@
+name: Rust CI
+
+# Checks a Cargo workspace: optional `cargo fmt --check`, then clippy and the
+# tests, with compiled dependencies cached by Swatinem/rust-cache. Runs on
+# ubuntu-latest unless `runner` names another; macOS runners cost ten times
+# the minutes in a private repository, so pick one only for a crate that
+# builds on macOS alone.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding the workspace's Cargo.toml.
+        required: false
+        type: string
+        default: .
+      runner:
+        description: Runner label, e.g. ubuntu-latest, ubuntu-24.04-arm or macos-26.
+        required: false
+        type: string
+        default: ubuntu-latest
+      toolchain:
+        description: >-
+          Rust toolchain to install, e.g. stable or 1.90.0. Empty uses
+          rust-toolchain.toml when the repository has one, otherwise stable.
+        required: false
+        type: string
+        default: ''
+      fmt:
+        description: Run `cargo fmt --all --check` first.
+        required: false
+        type: boolean
+        default: false
+      clippy:
+        description: Run clippy.
+        required: false
+        type: boolean
+        default: true
+      clippy-args:
+        description: Arguments after `cargo clippy`.
+        required: false
+        type: string
+        default: --all-targets --locked -- -D warnings
+      test:
+        description: Run the tests.
+        required: false
+        type: boolean
+        default: true
+      test-args:
+        description: Arguments after `cargo test`.
+        required: false
+        type: string
+        default: --locked
+      system-packages:
+        description: >-
+          Packages the build needs, space-separated: apt packages on Linux
+          (e.g. libudev-dev pkg-config), Homebrew packages on macOS.
+        required: false
+        type: string
+        default: ''
+      env:
+        description: Environment variables for every cargo command, one KEY=value per line.
+        required: false
+        type: string
+        default: ''
+      cache-save:
+        description: >-
+          When to save the Rust cache: default-branch (pull requests and
+          other branches restore the default branch's cache without saving
+          their own), always, or never.
+        required: false
+        type: string
+        default: default-branch
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 30
+
+jobs:
+  ci:
+    name: Rust CI
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    concurrency:
+      group: rust-ci-${{ github.repository }}-${{ inputs.working-directory }}-${{ inputs.runner }}-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set environment
+        env:
+          PLAIN: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          n=0
+          while IFS= read -r line; do
+            n=$((n + 1))
+            line="${line%$'\r'}"
+            [ -n "${line//[[:space:]]/}" ] || continue
+            key="${line%%=*}"
+            key="${key//[[:space:]]/}"
+            if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::line ${n} of env is not KEY=value"
+              exit 1
+            fi
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "${line#*=}" "$delim" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done <<< "$PLAIN"
+
+      - name: Install system packages
+        if: inputs.system-packages != ''
+        env:
+          PACKAGES: ${{ inputs.system-packages }}
+        run: |
+          set -euo pipefail
+          read -ra pkgs <<< "$PACKAGES"
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install "${pkgs[@]}"
+          else
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends "${pkgs[@]}"
+          fi
+
+      # rustup reads rust-toolchain.toml from the repository root or any
+      # parent of the working directory, and installs what it names.
+      - name: Install Rust
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          WANT_FMT: ${{ inputs.fmt }}
+          WANT_CLIPPY: ${{ inputs.clippy }}
+        run: |
+          set -euo pipefail
+          components=()
+          if [ "$WANT_FMT" = true ]; then components+=(rustfmt); fi
+          if [ "$WANT_CLIPPY" = true ]; then components+=(clippy); fi
+          comp_args=()
+          if [ "${#components[@]}" -gt 0 ]; then comp_args=(--component "$(IFS=,; echo "${components[*]}")"); fi
+          if [ -n "$TOOLCHAIN" ]; then
+            rustup toolchain install "$TOOLCHAIN" --profile minimal ${comp_args[@]+"${comp_args[@]}"}
+            rustup override set "$TOOLCHAIN"
+          elif [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] \
+            || [ -f "$GITHUB_WORKSPACE/rust-toolchain.toml" ] || [ -f "$GITHUB_WORKSPACE/rust-toolchain" ]; then
+            rustup toolchain install
+            for c in ${components[@]+"${components[@]}"}; do rustup component add "$c"; done
+          else
+            rustup toolchain install stable --profile minimal ${comp_args[@]+"${comp_args[@]}"}
+            rustup override set stable
+          fi
+          rustc --version
+          cargo --version
+
+      - name: Cache compiled dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ inputs.working-directory }}
+          save-if: >-
+            ${{ inputs.cache-save == 'always'
+            || (inputs.cache-save == 'default-branch' && github.ref_name == github.event.repository.default_branch) }}
+
+      - name: cargo fmt
+        if: inputs.fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        if: inputs.clippy
+        env:
+          ARGS: ${{ inputs.clippy-args }}
+        run: |
+          set -euo pipefail
+          read -ra args <<< "$ARGS"
+          cargo clippy ${args[@]+"${args[@]}"}
+
+      - name: cargo test
+        if: inputs.test
+        env:
+          ARGS: ${{ inputs.test-args }}
+        run: |
+          set -euo pipefail
+          read -ra args <<< "$ARGS"
+          cargo test ${args[@]+"${args[@]}"}

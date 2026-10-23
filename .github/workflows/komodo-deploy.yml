@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: refs/heads/main
+      timeout_minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 10
     secrets:
       webhook_secret:
         description: Shared secret the listener verifies. Must match KOMODO_WEBHOOK_SECRET.
@@ -31,6 +36,7 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.stack }}
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions: {}
     steps:
       - name: Trigger stack deploy
