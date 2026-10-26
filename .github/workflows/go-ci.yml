@@ -1,0 +1,113 @@
+name: Go CI
+
+# Sets up Go from the module's version file, checks formatting and generated
+# code if asked, then runs the given commands in order.
+
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        description: File holding the Go version (go.mod or .go-version), relative to working-directory.
+        required: false
+        type: string
+        default: go.mod
+      go-version:
+        description: Explicit Go version. Wins over go-version-file when set.
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: Directory holding go.mod.
+        required: false
+        type: string
+        default: .
+      fmt:
+        description: Fail when gofmt -l lists any file.
+        required: false
+        type: boolean
+        default: true
+      generate-check:
+        description: Run go generate ./... and fail when it changes or adds a file.
+        required: false
+        type: boolean
+        default: false
+      commands:
+        description: Commands to run, one per line, in order.
+        required: false
+        type: string
+        default: |
+          go vet ./...
+          go test ./...
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 20
+
+jobs:
+  ci:
+    name: Go CI
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    concurrency:
+      group: go-ci-${{ github.repository }}-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # setup-go caches the module and build caches, keyed on go.sum.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Check formatting
+        if: inputs.fmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Check generated code
+        if: inputs.generate-check
+        run: |
+          set -euo pipefail
+          go generate ./...
+          if [ -n "$(git status --porcelain -- .)" ]; then
+            echo "go generate changed files; run it and commit the result:" >&2
+            git status --porcelain -- . >&2
+            git diff -- . >&2
+            exit 1
+          fi
+
+      - name: Run commands
+        env:
+          COMMANDS: ${{ inputs.commands }}
+        run: |
+          set -euo pipefail
+          ran=0
+          while IFS= read -r command; do
+            command="${command%$'\r'}"
+            command="${command#"${command%%[![:space:]]*}"}"
+            command="${command%"${command##*[![:space:]]}"}"
+            [ -n "$command" ] || continue
+            ran=1
+            echo "::group::${command}"
+            eval "${command}"
+            echo "::endgroup::"
+          done <<< "$COMMANDS"
+          if [ "$ran" = 0 ]; then
+            echo "No commands requested."
+          fi
