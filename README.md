@@ -58,7 +58,7 @@ caller is invisible here. Pass values as inputs.
 A called workflow's jobs run inside the *caller's* workflow run, so there is no
 separate run for a workflow-level `concurrency:` block here to scope to. GitHub's
 own reusable-workflow reference discusses the guard only in its
-`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`,
+`jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`, `go-ci`,
 `cf-pages-deploy` and `upstream-sync` each carry a job-level guard.
 
 Each group name starts with a literal unique to its file. That is deliberate.
@@ -464,6 +464,47 @@ jobs:
       commands: |
         ruff check .
         pytest
+```
+
+---
+
+## `go-ci.yml`
+
+The shared Go gate: Go from the module's version file, an optional `gofmt` and
+`go generate` check, then the given commands in order.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `go-version-file` | no | `go.mod` | Version file (`go.mod` or `.go-version`), relative to `working-directory` |
+| `go-version` | no | `''` | Explicit version; wins over the file |
+| `working-directory` | no | `.` | Directory holding `go.mod` |
+| `fmt` | no | `true` | Fail when `gofmt -l` lists a file |
+| `generate-check` | no | `false` | Run `go generate ./...` and fail when it changes or adds a file |
+| `commands` | no | `go vet ./...` and `go test ./...` | Commands, one per line, in order |
+| `timeout-minutes` | no | `20` | Job timeout |
+
+Secrets: none.
+
+Permissions the calling job must grant:
+
+```yaml
+permissions:
+  contents: read
+```
+
+`setup-go` caches the module and build caches, keyed on `go.sum`.
+`generate-check` catches a schema or source change committed without its
+regenerated code.
+
+```yaml
+jobs:
+  go:
+    uses: noahkiss/workflows/.github/workflows/go-ci.yml@main
+    permissions:
+      contents: read
+    with:
+      go-version-file: .go-version
+      generate-check: true
 ```
 
 ---
