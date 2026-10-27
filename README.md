@@ -40,6 +40,11 @@ Keep the comment in step with the SHA.
 Dependabot raises the bumps here weekly and understands this format natively: it
 rewrites both the SHA and the comment. One merge here updates every caller.
 
+`.github/workflows/selftest.yml` calls the workflows and the `komodo-deploy`
+action against the fixtures in `selftest/` on every change to them. Add a job
+there for each new input. The deploy path posts to a stand-in listener on the
+runner, never to a real one.
+
 ## Rules that apply to all of them
 
 **Secrets never flow implicitly.** A called workflow sees only the secrets the
@@ -136,6 +141,19 @@ organization variable.
 
 Permissions: none. The job declares `permissions: {}`.
 
+The post itself is the composite action `actions/komodo-deploy`, which
+`ghcr-build-push.yml` also runs for its in-job deploy (see
+[Deploy in the same job](#deploy-in-the-same-job-deploy_stack)). One copy of
+the signing logic serves both. A job of your own can run it as a step:
+
+```yaml
+      - uses: noahkiss/workflows/actions/komodo-deploy@main
+        with:
+          stack: my-stack
+          listener-url: ${{ vars.KOMODO_LISTENER_URL }}
+          webhook-secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
+```
+
 It signs the payload with HMAC-SHA256 and sends the hex digest in
 `X-Hub-Signature-256`. A non-2xx reply fails the job. The secret and the
 signature are never printed.
@@ -161,7 +179,9 @@ jobs:
 ```
 
 Deploy after the image is published, not on push — the image is still building
-at push time:
+at push time. An image built by `ghcr-build-push.yml` should deploy from that
+job with `deploy_stack` instead: a separate deploy job takes seconds but is
+billed a whole minute. The two-job shape stays valid:
 
 ```yaml
 jobs:
@@ -202,6 +222,10 @@ Replaces the near-identical GHCR build in ten repositories. It builds
 | `smoke_command` | no | `''` → skipped | Command run against a pre-push build |
 | `push` | no | `true` | `false` builds and smoke-tests every platform, pushes nothing |
 | `native_runners` | no | `false` | Build each platform on its own runner; see below |
+| `revision_command` | no | `''` → none | Command printing the revision the image packages; see below |
+| `skip_if_label` | no | `''` → never skip | Label key compared with that revision; see below |
+| `deploy_stack` | no | `''` → no deploy | Komodo stack to redeploy after the push; see below |
+| `listener_url` | with `deploy_stack` | `''` | Komodo listener base URL, no trailing slash |
 | `timeout_minutes` | no | `45` | Timeout of each build job |
 
 Default `tags`:
@@ -213,12 +237,18 @@ type=sha,prefix=sha-
 type=raw,value=latest,enable={{is_default_branch}}
 ```
 
-Secrets: none. It logs in with `github.actor` and the job's `GITHUB_TOKEN`.
+It logs in with `github.actor` and the job's `GITHUB_TOKEN`.
+
+| Secret | Required | Meaning |
+|---|---|---|
+| `webhook_secret` | with `deploy_stack` and `push` | Shared secret of the Komodo listener |
 
 | Output | Meaning |
 |---|---|
 | `digest` | Digest of the pushed image; empty with `push: false` |
 | `tags` | Tags that were applied, one per line |
+| `skipped` | `true` when `skip_if_label` found the revision already published |
+| `revision` | What `revision_command` printed; empty without it |
 
 Permissions the calling job must grant, with `push: false` too (the called job
 declares them, and a called job cannot exceed its caller):
@@ -306,6 +336,73 @@ platform's own runner before its push.
       native_runners: true
 ```
 
+### Deploy in the same job: `deploy_stack`
+
+Set `deploy_stack` and the job that pushes the image posts the Komodo deploy
+as its last step, through `actions/komodo-deploy` (see `komodo-deploy.yml`
+above). With `native_runners` that is the merge job. A run that pushes nothing
+(`push: false`, or a build skipped by `skip_if_label`) deploys nothing.
+
+The job fails at its first step when `deploy_stack` is set without
+`listener_url`, or without the `webhook_secret` secret while `push` is true.
+
+**Gate the branch yourself**, by passing an empty stack off the default branch:
+
+```yaml
+jobs:
+  build:
+    uses: noahkiss/workflows/.github/workflows/ghcr-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+      deploy_stack: ${{ github.ref == 'refs/heads/main' && 'my-stack' || '' }}
+      listener_url: ${{ vars.KOMODO_LISTENER_URL }}
+    secrets:
+      webhook_secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
+```
+
+### Packaging another project: `revision_command` and `skip_if_label`
+
+For an image that packages a project you do not own, rebuilt on a schedule.
+`revision_command` runs after the checkout and prints one line, the revision
+being packaged. `{revision}` and `{revision_short}` (its first 12 characters)
+in `tags`, `labels` and `build_args` are replaced with it.
+
+`skip_if_label` names a label. Before building, the job reads the image config
+at the first tag the tag rules produce. When that label already holds the
+revision, the build, push and deploy are skipped and `skipped` is `true`. A
+missing image or label builds. It needs `revision_command`.
+
+Pass the label only on scheduled runs, so a push or a manual run always builds:
+
+```yaml
+on:
+  schedule:
+    - cron: '23 9 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: noahkiss/workflows/.github/workflows/ghcr-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      revision_command: git ls-remote https://github.com/example/app.git refs/heads/main | cut -f1
+      skip_if_label: ${{ github.event_name == 'schedule' && 'upstream.revision' || '' }}
+      tags: |
+        type=raw,value=main
+        type=raw,value=up-{revision_short}
+      labels: |
+        upstream.revision={revision}
+      build_args: |
+        APP_REF={revision}
+```
+
 ### Building from a `workflow_run` event
 
 A `workflow_run` job checks out the default branch, not the commit that
@@ -356,6 +453,10 @@ lockfile, then runs the named package scripts in order.
 | `audit` | no | `false` | Gate on `npm audit --omit=dev --audit-level=high` |
 | `services` | no | `''` → none | Service containers, a JSON object in the shape of a job's `services:` |
 | `env` | no | `''` | Environment for install and the scripts, one `KEY=value` per line |
+| `playwright` | no | `''` → none | Playwright browsers to install, space-separated, e.g. `chromium` |
+| `artifact_path` | no | `''` → no upload | Path to upload, relative to `working-directory` |
+| `artifact_name` | no | `node-ci-artifact` | Artifact name; unique per run |
+| `artifact_when` | no | `failure` | `failure`, or `always` (any run not cancelled) |
 | `timeout-minutes` | no | `20` | Job timeout |
 
 | Secret | Required | Meaning |
@@ -410,6 +511,21 @@ so a script reaches a service at `localhost` on its mapped port:
     secrets:
       env_secrets: |
         API_KEY=${{ secrets.API_KEY }}
+```
+
+**Playwright end-to-end tests.** `playwright` installs the named browsers with
+`--with-deps` before the scripts run, through the Playwright version the
+lockfile installed. `~/.cache/ms-playwright` is cached on that version and the
+browser list. `artifact_path` uploads the report, kept 7 days:
+
+```yaml
+    with:
+      scripts: |
+        test:unit
+        test:e2e
+      playwright: chromium
+      artifact_path: playwright-report/
+      artifact_name: playwright-report
 ```
 
 ---
@@ -512,7 +628,7 @@ jobs:
 ## `rust-ci.yml`
 
 The shared Rust gate for a Cargo workspace: optional `cargo fmt --check`, then
-clippy and the tests, with `Swatinem/rust-cache`.
+clippy, an optional `cargo build` and the tests, with `Swatinem/rust-cache`.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
@@ -522,6 +638,8 @@ clippy and the tests, with `Swatinem/rust-cache`.
 | `fmt` | no | `false` | Run `cargo fmt --all --check` first |
 | `clippy` | no | `true` | Run clippy |
 | `clippy-args` | no | `--all-targets --locked -- -D warnings` | Arguments after `cargo clippy` |
+| `targets` | no | `''` | Extra rustup targets, space-separated, e.g. `wasm32-wasip1` |
+| `build-args` | no | `''` → no build | Arguments after `cargo build`, run after clippy |
 | `test` | no | `true` | Run the tests |
 | `test-args` | no | `--locked` | Arguments after `cargo test` |
 | `system-packages` | no | `''` | apt packages on Linux, Homebrew packages on macOS, space-separated |
@@ -552,6 +670,18 @@ jobs:
       working-directory: src-tauri
       fmt: true
       system-packages: libudev-dev pkg-config
+```
+
+**A WebAssembly crate.** `targets` installs the target; the build target comes
+from `.cargo/config.toml` (`[build] target = "wasm32-wasip1"`) or from the
+arguments. Tests for a wasm target need a runtime, so turn them off:
+
+```yaml
+    with:
+      fmt: true
+      targets: wasm32-wasip1
+      build-args: --release --locked
+      test: false
 ```
 
 ---

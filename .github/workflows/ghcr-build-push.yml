@@ -285,11 +285,13 @@ jobs:
         id: skip
         if: inputs.skip_if_label != ''
         env:
-          FIRST_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          META: ${{ steps.meta.outputs.json }}
           LABEL: ${{ inputs.skip_if_label }}
           REVISION: ${{ steps.rev.outputs.revision }}
         run: |
           set -euo pipefail
+          FIRST_TAG=$(jq -r '.tags[0] // empty' <<< "$META")
+          [ -n "$FIRST_TAG" ] || { echo "::error::the tag rules produced no tags"; exit 1; }
           published=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Image}}' 2>/dev/null \
             | jq -r --arg l "$LABEL" '.. | objects | select(has("Labels")) | .Labels[$l] // empty' \
             | head -1 || true)
@@ -528,11 +530,13 @@ jobs:
         id: skip
         if: inputs.skip_if_label != ''
         env:
-          FIRST_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          META: ${{ steps.meta.outputs.json }}
           LABEL: ${{ inputs.skip_if_label }}
           REVISION: ${{ steps.rev.outputs.revision }}
         run: |
           set -euo pipefail
+          FIRST_TAG=$(jq -r '.tags[0] // empty' <<< "$META")
+          [ -n "$FIRST_TAG" ] || { echo "::error::the tag rules produced no tags"; exit 1; }
           published=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Image}}' 2>/dev/null \
             | jq -r --arg l "$LABEL" '.. | objects | select(has("Labels")) | .Labels[$l] // empty' \
             | head -1 || true)
