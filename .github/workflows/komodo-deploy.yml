@@ -39,76 +39,14 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions: {}
     steps:
+      # The signing logic lives in the composite action, which
+      # ghcr-build-push also runs, so the two cannot drift. A reusable
+      # workflow resolves a ./ path against the caller's checkout, so the
+      # action is referenced by repository.
       - name: Trigger stack deploy
-        env:
-          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
-          LISTENER_URL: ${{ inputs.listener_url }}
-          STACK: ${{ inputs.stack }}
-          PAYLOAD_REF: ${{ inputs.ref }}
-        run: |
-          set -euo pipefail
-
-          payload="{\"ref\":\"${PAYLOAD_REF}\"}"
-          sig=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
-          url="${LISTENER_URL%/}/stack/${STACK}/deploy"
-
-          # A CDN or WAF in front of the listener can reject the runner itself,
-          # before the request ever reaches the listener. A retry runs on the
-          # same runner, so it clears transient edge state but not a block tied
-          # to the runner's location; fix those at the edge, not here. Retry
-          # only what a second attempt can plausibly fix: a transport error,
-          # a 429, a 5xx, or a 403 that carries an HTML error
-          # page rather than the listener's own reply. Every other 4xx, a 401
-          # above all, is a real answer and must not be repeated.
-          max_attempts=2
-          backoff=75
-
-          echo "POST ${url}"
-          attempt=1
-          while true; do
-            rc=0
-            status=$(curl --silent --show-error --location \
-              --output response.txt --write-out '%{http_code}' \
-              --max-time 60 \
-              --request POST "$url" \
-              --header 'Content-Type: application/json' \
-              --header 'X-GitHub-Event: push' \
-              --header "X-Hub-Signature-256: sha256=${sig}" \
-              --data "$payload") || rc=$?
-
-            if [ "$rc" -ne 0 ]; then
-              status=000
-              echo "Attempt ${attempt}: curl exited ${rc} with no response."
-            else
-              echo "Attempt ${attempt}: listener responded with HTTP ${status}"
-            fi
-
-            if [ "${status#2}" != "$status" ]; then
-              echo "Deploy request accepted."
-              exit 0
-            fi
-
-            retryable=no
-            case "$status" in
-              000|429|5??) retryable=yes ;;
-              403)
-                # The listener answers in JSON or plain text. An HTML body on a
-                # 403 means something upstream blocked us, not the listener.
-                if grep -qiE '<!doctype html|<html' response.txt; then
-                  retryable=yes
-                fi
-                ;;
-            esac
-
-            if [ "$retryable" = no ] || [ "$attempt" -ge "$max_attempts" ]; then
-              break
-            fi
-
-            echo "Retrying once in ${backoff}s on a fresh runner."
-            sleep "$backoff"
-            attempt=$((attempt + 1))
-          done
-
-          echo "Deploy request failed." >&2
-          head -c 2000 response.txt >&2 || true
-          exit 1
+        uses: noahkiss/workflows/actions/komodo-deploy@main
+        with:
+          stack: ${{ inputs.stack }}
+          listener-url: ${{ inputs.listener_url }}
+          ref: ${{ inputs.ref }}
+          webhook-secret: ${{ secrets.webhook_secret }}

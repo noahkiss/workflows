@@ -1,7 +1,8 @@
 name: Rust CI
 
-# Checks a Cargo workspace: optional `cargo fmt --check`, then clippy and the
-# tests, with compiled dependencies cached by Swatinem/rust-cache. Runs on
+# Checks a Cargo workspace: optional `cargo fmt --check`, then clippy, an
+# optional `cargo build` and the tests, with compiled dependencies cached by
+# Swatinem/rust-cache. `targets` adds rustup targets, e.g. wasm32-wasip1. Runs on
 # ubuntu-latest unless `runner` names another; macOS runners cost ten times
 # the minutes in a private repository, so pick one only for a crate that
 # builds on macOS alone.
@@ -41,6 +42,20 @@ on:
         required: false
         type: string
         default: --all-targets --locked -- -D warnings
+      targets:
+        description: >-
+          Extra rustup targets to install, space-separated, e.g. wasm32-wasip1.
+          Pick the build target with build-args or .cargo/config.toml.
+        required: false
+        type: string
+        default: ''
+      build-args:
+        description: >-
+          Arguments after `cargo build`, e.g. --release --locked. The build
+          runs after clippy and before the tests. Empty skips the build.
+        required: false
+        type: string
+        default: ''
       test:
         description: Run the tests.
         required: false
@@ -139,6 +154,7 @@ jobs:
           TOOLCHAIN: ${{ inputs.toolchain }}
           WANT_FMT: ${{ inputs.fmt }}
           WANT_CLIPPY: ${{ inputs.clippy }}
+          TARGETS: ${{ inputs.targets }}
         run: |
           set -euo pipefail
           components=()
@@ -157,6 +173,8 @@ jobs:
             rustup toolchain install stable --profile minimal ${comp_args[@]+"${comp_args[@]}"}
             rustup override set stable
           fi
+          read -ra targets <<< "$TARGETS"
+          if [ "${#targets[@]}" -gt 0 ]; then rustup target add "${targets[@]}"; fi
           rustc --version
           cargo --version
 
@@ -180,6 +198,15 @@ jobs:
           set -euo pipefail
           read -ra args <<< "$ARGS"
           cargo clippy ${args[@]+"${args[@]}"}
+
+      - name: cargo build
+        if: inputs.build-args != ''
+        env:
+          ARGS: ${{ inputs.build-args }}
+        run: |
+          set -euo pipefail
+          read -ra args <<< "$ARGS"
+          cargo build "${args[@]}"
 
       - name: cargo test
         if: inputs.test

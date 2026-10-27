@@ -1,0 +1,7 @@
+{
+  "name": "selftest-node",
+  "private": true,
+  "scripts": {
+    "test": "test \"$PLAIN_VAR\" = plain && test \"$SECRET_VAR\" = masked-value && psql -h localhost -U postgres -tAc 'select 1' | grep -qx 1 && echo services-and-env-ok"
+  }
+}

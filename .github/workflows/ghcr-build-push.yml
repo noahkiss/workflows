@@ -5,6 +5,10 @@ name: GHCR build and push
 # `push: false` builds without pushing, for pull requests. `native_runners`
 # builds each platform on its own runner (arm64 on an arm64 runner, no QEMU)
 # and joins the digests into one manifest list.
+# `deploy_stack` asks a Komodo listener to redeploy a stack once the image is
+# pushed, in the same job. `revision_command` and `skip_if_label` skip the
+# build when the published image already carries the revision, for an image
+# that packages another project.
 # The calling job must grant `packages: write`, with `push: false` too; a
 # called workflow cannot hold more token permission than its caller.
 
@@ -94,11 +98,53 @@ on:
         required: false
         type: boolean
         default: false
+      revision_command:
+        description: >-
+          Shell command that prints one line: the revision this build
+          packages, e.g. an upstream commit from git ls-remote. It runs after
+          the checkout. `{revision}` and `{revision_short}` (its first 12
+          characters) in tags, labels and build_args are replaced by it.
+          Empty runs nothing and replaces nothing.
+        required: false
+        type: string
+        default: ''
+      skip_if_label:
+        description: >-
+          Image label key. When the image at the first tag the tag rules
+          produce already carries this label with the value of
+          revision_command, the build, push and deploy are skipped and the
+          skipped output is true. Needs revision_command. A missing image or
+          label builds. Empty never skips.
+        required: false
+        type: string
+        default: ''
+      deploy_stack:
+        description: >-
+          Komodo stack to redeploy after a successful push, in the same job.
+          Empty deploys nothing. No deploy happens when push is false or the
+          build was skipped. The caller gates the branch by passing an empty
+          value off the default branch.
+        required: false
+        type: string
+        default: ''
+      listener_url:
+        description: >-
+          Base URL of the Komodo webhook listener, without a trailing slash.
+          Required when deploy_stack is set.
+        required: false
+        type: string
+        default: ''
       timeout_minutes:
         description: Timeout in minutes of each build job.
         required: false
         type: number
         default: 45
+    secrets:
+      webhook_secret:
+        description: >-
+          Shared secret the Komodo listener verifies. Required when
+          deploy_stack is set and push is true.
+        required: false
     outputs:
       digest:
         description: Digest of the pushed image (the manifest list with native_runners). Empty when push is false.
@@ -106,6 +152,12 @@ on:
       tags:
         description: Tags docker/metadata-action produced, one per line.
         value: ${{ jobs.build.outputs.tags || jobs.merge.outputs.tags }}
+      skipped:
+        description: true when skip_if_label found the revision already published, otherwise false.
+        value: ${{ jobs.build.outputs.skipped || jobs.plan.outputs.skipped }}
+      revision:
+        description: What revision_command printed. Empty without it.
+        value: ${{ jobs.build.outputs.revision || jobs.plan.outputs.revision }}
 
 jobs:
   build:
@@ -125,11 +177,76 @@ jobs:
     outputs:
       digest: ${{ steps.push.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
+      skipped: ${{ steps.skip.outputs.skip || 'false' }}
+      revision: ${{ steps.rev.outputs.revision }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout_ref }}
+
+      - name: Check inputs
+        env:
+          DEPLOY_STACK: ${{ inputs.deploy_stack }}
+          LISTENER_URL: ${{ inputs.listener_url }}
+          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
+          PUSH: ${{ inputs.push }}
+          REVISION_COMMAND: ${{ inputs.revision_command }}
+          SKIP_IF_LABEL: ${{ inputs.skip_if_label }}
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ -n "$DEPLOY_STACK" ]; then
+            if [ -z "$LISTENER_URL" ]; then
+              echo "::error::deploy_stack is set, so listener_url is required"; fail=1
+            fi
+            if [ "$PUSH" = true ] && [ -z "$WEBHOOK_SECRET" ]; then
+              echo "::error::deploy_stack is set, so the webhook_secret secret is required. Name it under secrets: in the calling job."; fail=1
+            fi
+            if [ "$PUSH" != true ]; then
+              echo "::notice::push is false: ${DEPLOY_STACK} will not be deployed"
+            fi
+          fi
+          if [ -n "$SKIP_IF_LABEL" ] && [ -z "$REVISION_COMMAND" ]; then
+            echo "::error::skip_if_label needs revision_command"; fail=1
+          fi
+          exit "$fail"
+
+      - name: Resolve the revision
+        id: rev
+        env:
+          REVISION_COMMAND: ${{ inputs.revision_command }}
+          TAGS: ${{ inputs.tags }}
+          LABELS: ${{ inputs.labels }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+          revision=""
+          if [ -n "$REVISION_COMMAND" ]; then
+            revision=$(bash -euo pipefail -c "$REVISION_COMMAND")
+            if [ -z "$revision" ] || [[ "$revision" == *$'\n'* ]]; then
+              echo "::error::revision_command must print exactly one non-empty line"
+              exit 1
+            fi
+            echo "Revision: ${revision}"
+          fi
+          short="${revision:0:12}"
+          {
+            echo "revision=${revision}"
+            for name in tags labels build_args; do
+              case "$name" in
+                tags) value="$TAGS" ;;
+                labels) value="$LABELS" ;;
+                build_args) value="$BUILD_ARGS" ;;
+              esac
+              if [ -n "$revision" ]; then
+                value="${value//\{revision_short\}/$short}"
+                value="${value//\{revision\}/$revision}"
+              fi
+              delim="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim"
+            done
+          } >> "$GITHUB_OUTPUT"
 
       - name: Resolve image name
         id: image
@@ -146,14 +263,8 @@ jobs:
           echo "name=${image}" >> "$GITHUB_OUTPUT"
           echo "Image: ${image}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-
       - name: Log in to GHCR
-        if: inputs.push
+        if: inputs.push || inputs.skip_if_label != ''
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -165,25 +276,55 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ steps.image.outputs.name }}
-          tags: ${{ inputs.tags }}
-          labels: ${{ inputs.labels }}
+          tags: ${{ steps.rev.outputs.tags }}
+          labels: ${{ steps.rev.outputs.labels }}
+
+      # Reads the image config only, not the layers. A missing image, a
+      # missing label or any other failure reads as unpublished and builds.
+      - name: Compare the published revision
+        id: skip
+        if: inputs.skip_if_label != ''
+        env:
+          FIRST_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          LABEL: ${{ inputs.skip_if_label }}
+          REVISION: ${{ steps.rev.outputs.revision }}
+        run: |
+          set -euo pipefail
+          published=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r --arg l "$LABEL" '.. | objects | select(has("Labels")) | .Labels[$l] // empty' \
+            | head -1 || true)
+          if [ "$published" = "$REVISION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${FIRST_TAG} already carries ${LABEL}=\`${REVISION}\`: build skipped." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${FIRST_TAG} carries ${LABEL}=\`${published:-none}\`; building \`${REVISION}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up QEMU
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Buildx
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build amd64 image for the smoke test
-        if: inputs.smoke_command != ''
+        if: inputs.smoke_command != '' && steps.skip.outputs.skip != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: linux/amd64
           load: true
-          build-args: ${{ inputs.build_args }}
+          build-args: ${{ steps.rev.outputs.build_args }}
           push: false
           tags: ${{ steps.image.outputs.name }}:smoke
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Run the smoke test
-        if: inputs.smoke_command != ''
+        if: inputs.smoke_command != '' && steps.skip.outputs.skip != 'true'
         env:
           IMAGE: ${{ steps.image.outputs.name }}:smoke
           SMOKE_COMMAND: ${{ inputs.smoke_command }}
@@ -191,13 +332,14 @@ jobs:
 
       - name: Build and push
         id: push
+        if: steps.skip.outputs.skip != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
           push: ${{ inputs.push }}
-          build-args: ${{ inputs.build_args }}
+          build-args: ${{ steps.rev.outputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
@@ -205,6 +347,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Summarise
+        if: steps.skip.outputs.skip != 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -227,18 +370,105 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # A reusable workflow resolves a ./ action path against the caller's
+      # checkout, so the shared action is referenced by repository.
+      - name: Deploy the stack
+        if: inputs.push && inputs.deploy_stack != '' && steps.skip.outputs.skip != 'true'
+        uses: noahkiss/workflows/actions/komodo-deploy@main
+        with:
+          stack: ${{ inputs.deploy_stack }}
+          listener-url: ${{ inputs.listener_url }}
+          webhook-secret: ${{ secrets.webhook_secret }}
+
   # native_runners: plan -> one build per platform on its own runner -> merge.
   plan:
     name: Plan the platform builds
     if: inputs.native_runners
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      contents: read
+      packages: read
     outputs:
       image: ${{ steps.plan.outputs.image }}
       key: ${{ steps.plan.outputs.key }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      tags: ${{ steps.rev.outputs.tags }}
+      labels: ${{ steps.rev.outputs.labels }}
+      build_args: ${{ steps.rev.outputs.build_args }}
+      revision: ${{ steps.rev.outputs.revision }}
+      skipped: ${{ steps.skip.outputs.skip || 'false' }}
     steps:
+      # The plan job checks out only to run revision_command.
+      - name: Checkout
+        if: inputs.revision_command != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Check inputs
+        env:
+          DEPLOY_STACK: ${{ inputs.deploy_stack }}
+          LISTENER_URL: ${{ inputs.listener_url }}
+          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
+          PUSH: ${{ inputs.push }}
+          REVISION_COMMAND: ${{ inputs.revision_command }}
+          SKIP_IF_LABEL: ${{ inputs.skip_if_label }}
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ -n "$DEPLOY_STACK" ]; then
+            if [ -z "$LISTENER_URL" ]; then
+              echo "::error::deploy_stack is set, so listener_url is required"; fail=1
+            fi
+            if [ "$PUSH" = true ] && [ -z "$WEBHOOK_SECRET" ]; then
+              echo "::error::deploy_stack is set, so the webhook_secret secret is required. Name it under secrets: in the calling job."; fail=1
+            fi
+            if [ "$PUSH" != true ]; then
+              echo "::notice::push is false: ${DEPLOY_STACK} will not be deployed"
+            fi
+          fi
+          if [ -n "$SKIP_IF_LABEL" ] && [ -z "$REVISION_COMMAND" ]; then
+            echo "::error::skip_if_label needs revision_command"; fail=1
+          fi
+          exit "$fail"
+
+      - name: Resolve the revision
+        id: rev
+        env:
+          REVISION_COMMAND: ${{ inputs.revision_command }}
+          TAGS: ${{ inputs.tags }}
+          LABELS: ${{ inputs.labels }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+          revision=""
+          if [ -n "$REVISION_COMMAND" ]; then
+            revision=$(bash -euo pipefail -c "$REVISION_COMMAND")
+            if [ -z "$revision" ] || [[ "$revision" == *$'\n'* ]]; then
+              echo "::error::revision_command must print exactly one non-empty line"
+              exit 1
+            fi
+            echo "Revision: ${revision}"
+          fi
+          short="${revision:0:12}"
+          {
+            echo "revision=${revision}"
+            for name in tags labels build_args; do
+              case "$name" in
+                tags) value="$TAGS" ;;
+                labels) value="$LABELS" ;;
+                build_args) value="$BUILD_ARGS" ;;
+              esac
+              if [ -n "$revision" ]; then
+                value="${value//\{revision_short\}/$short}"
+                value="${value//\{revision\}/$revision}"
+              fi
+              delim="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim"
+            done
+          } >> "$GITHUB_OUTPUT"
+
       - name: Map each platform to a runner
         id: plan
         env:
@@ -276,9 +506,48 @@ jobs:
           echo "Image: ${image}"
           echo "Builds: ${matrix}"
 
+      - name: Log in to GHCR
+        if: inputs.skip_if_label != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        if: inputs.skip_if_label != ''
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.plan.outputs.image }}
+          tags: ${{ steps.rev.outputs.tags }}
+
+      # Reads the image config only, not the layers. A missing image, a
+      # missing label or any other failure reads as unpublished and builds.
+      - name: Compare the published revision
+        id: skip
+        if: inputs.skip_if_label != ''
+        env:
+          FIRST_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          LABEL: ${{ inputs.skip_if_label }}
+          REVISION: ${{ steps.rev.outputs.revision }}
+        run: |
+          set -euo pipefail
+          published=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r --arg l "$LABEL" '.. | objects | select(has("Labels")) | .Labels[$l] // empty' \
+            | head -1 || true)
+          if [ "$published" = "$REVISION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${FIRST_TAG} already carries ${LABEL}=\`${REVISION}\`: build skipped." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${FIRST_TAG} carries ${LABEL}=\`${published:-none}\`; building \`${REVISION}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   native:
     name: Build ${{ matrix.platform }}
     needs: plan
+    if: needs.plan.outputs.skipped != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions:
@@ -313,7 +582,7 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ needs.plan.outputs.image }}
-          labels: ${{ inputs.labels }}
+          labels: ${{ needs.plan.outputs.labels }}
 
       # Each platform runs the smoke test on its own architecture.
       - name: Build the image for the smoke test
@@ -324,7 +593,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           load: true
-          build-args: ${{ inputs.build_args }}
+          build-args: ${{ needs.plan.outputs.build_args }}
           push: false
           tags: ${{ needs.plan.outputs.image }}:smoke
           cache-from: type=gha,scope=${{ matrix.slug }}
@@ -346,7 +615,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
-          build-args: ${{ inputs.build_args }}
+          build-args: ${{ needs.plan.outputs.build_args }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: >-
             ${{ inputs.push
@@ -413,8 +682,8 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ needs.plan.outputs.image }}
-          tags: ${{ inputs.tags }}
-          labels: ${{ inputs.labels }}
+          tags: ${{ needs.plan.outputs.tags }}
+          labels: ${{ needs.plan.outputs.labels }}
 
       - name: Create and push the manifest list
         id: push
@@ -450,3 +719,13 @@ jobs:
             printf '%s\n' "$TAGS"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # A reusable workflow resolves a ./ action path against the caller's
+      # checkout, so the shared action is referenced by repository.
+      - name: Deploy the stack
+        if: inputs.deploy_stack != ''
+        uses: noahkiss/workflows/actions/komodo-deploy@main
+        with:
+          stack: ${{ inputs.deploy_stack }}
+          listener-url: ${{ inputs.listener_url }}
+          webhook-secret: ${{ secrets.webhook_secret }}

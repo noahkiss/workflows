@@ -3,7 +3,9 @@ name: Node CI
 # Installs dependencies with the detected package manager, then runs the named
 # package scripts in order. Optionally gates on `npm audit`. `services` starts
 # service containers (a database, a cache) beside the job, and `env` and
-# `env_secrets` set environment variables for the scripts.
+# `env_secrets` set environment variables for the scripts. `playwright`
+# installs Playwright browsers before the scripts, and `artifact_path` uploads
+# a report directory when the job fails.
 
 on:
   workflow_call:
@@ -61,6 +63,36 @@ on:
         required: false
         type: string
         default: ''
+      playwright:
+        description: >-
+          Playwright browsers to install before the scripts, space-separated,
+          e.g. chromium. Installs with --with-deps, through the Playwright
+          version the lockfile pins, and caches ~/.cache/ms-playwright on that
+          version. Empty installs none.
+        required: false
+        type: string
+        default: ''
+      artifact_path:
+        description: >-
+          Path to upload as an artifact, relative to working-directory, e.g.
+          playwright-report/. Kept 7 days. Empty uploads nothing.
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: >-
+          Artifact name. Must be unique in the caller's run when two node-ci
+          jobs upload.
+        required: false
+        type: string
+        default: node-ci-artifact
+      artifact_when:
+        description: >-
+          always uploads unless the run was cancelled. Any other value,
+          failure by default, uploads only when a step failed.
+        required: false
+        type: string
+        default: failure
       timeout-minutes:
         description: Job timeout in minutes.
         required: false
@@ -201,6 +233,45 @@ jobs:
             npm ci
           fi
 
+      - name: Read the Playwright version
+        id: playwright
+        if: inputs.playwright != ''
+        env:
+          MANAGER: ${{ steps.pm.outputs.manager }}
+        run: |
+          set -euo pipefail
+          if [ "$MANAGER" = pnpm ]; then
+            version=$(pnpm exec playwright --version)
+          else
+            version=$(npx --no-install playwright --version)
+          fi
+          version="${version##* }"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Playwright ${version}"
+
+      - name: Cache Playwright browsers
+        if: inputs.playwright != ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ inputs.playwright }}
+
+      # --with-deps installs the system libraries from apt as well; those are
+      # not cached, and a cache hit skips only the browser download.
+      - name: Install Playwright browsers
+        if: inputs.playwright != ''
+        env:
+          MANAGER: ${{ steps.pm.outputs.manager }}
+          BROWSERS: ${{ inputs.playwright }}
+        run: |
+          set -euo pipefail
+          read -ra browsers <<< "$BROWSERS"
+          if [ "$MANAGER" = pnpm ]; then
+            pnpm exec playwright install --with-deps "${browsers[@]}"
+          else
+            npx --no-install playwright install --with-deps "${browsers[@]}"
+          fi
+
       - name: Run scripts
         env:
           MANAGER: ${{ steps.pm.outputs.manager }}
@@ -263,3 +334,14 @@ jobs:
       - name: Report skipped audit
         if: inputs.audit && steps.pm.outputs.manager != 'npm'
         run: echo "The audit gate is npm only. Skipped."
+
+      - name: Upload artifact
+        if: >-
+          inputs.artifact_path != '' && !cancelled()
+          && (inputs.artifact_when == 'always' || failure())
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.artifact_path }}
+          if-no-files-found: warn
+          retention-days: 7

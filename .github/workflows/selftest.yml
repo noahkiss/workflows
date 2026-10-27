@@ -1,0 +1,290 @@
+name: Selftest
+
+# Calls each shared workflow and the komodo-deploy action against the small
+# fixtures in selftest/, so a change is proven here before callers take it
+# at @main. Nothing here posts to a real listener: the deploy path is checked
+# against a stand-in listener on the runner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - actions/**
+      - selftest/**
+  pull_request:
+    paths:
+      - .github/workflows/**
+      - actions/**
+      - selftest/**
+  workflow_dispatch:
+
+concurrency:
+  group: selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      working-directory: selftest/node
+      scripts: test
+      services: >-
+        {"postgres": {"image": "postgres:17", "env": {"POSTGRES_HOST_AUTH_METHOD": "trust"},
+        "ports": ["5432:5432"], "options": "--health-cmd pg_isready --health-interval 5s --health-retries 10"}}
+      env: |
+        PLAIN_VAR=plain
+      timeout-minutes: 10
+    secrets:
+      env_secrets: |
+        SECRET_VAR=masked-value
+
+  node-plain:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      working-directory: selftest/node-plain
+      scripts: ''
+
+  node-playwright:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      working-directory: selftest/node-playwright
+      scripts: test
+      playwright: chromium
+      artifact_path: playwright-report/
+      artifact_name: selftest-playwright-report
+      artifact_when: always
+
+  node-playwright-check:
+    needs: node-playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: selftest-playwright-report
+          path: report
+      - run: test -f report/index.html
+
+  rust:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust-ci.yml
+    with:
+      working-directory: selftest/rust
+      fmt: true
+
+  # The crate's .cargo/config.toml makes wasm32-wasip1 the build target.
+  rust-wasm:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/rust-ci.yml
+    with:
+      working-directory: selftest/rust-wasm
+      targets: wasm32-wasip1
+      build-args: --release --locked
+      test: false
+
+  image-pr:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest
+      context: selftest/docker
+      platforms: linux/amd64,linux/arm64
+      push: false
+      smoke_command: docker run --rm "$IMAGE"
+      # push is false, so this must not post anything.
+      deploy_stack: selftest
+      listener_url: https://listener.invalid/listener/github
+
+  image-pr-native:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest-pr
+      context: selftest/docker
+      platforms: linux/amd64,linux/arm64
+      push: false
+      native_runners: true
+      smoke_command: docker run --rm "$IMAGE"
+
+  image-native:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest
+      context: selftest/docker
+      platforms: linux/amd64,linux/arm64
+      native_runners: true
+      tags: |
+        type=raw,value=selftest
+      smoke_command: docker run --rm "$IMAGE"
+
+  image-check:
+    needs: image-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - env:
+          DIGEST: ${{ needs.image-native.outputs.digest }}
+          TAGS: ${{ needs.image-native.outputs.tags }}
+        run: |
+          set -euo pipefail
+          echo "digest=$DIGEST tags=$TAGS"
+          [ -n "$DIGEST" ]
+          docker buildx imagetools inspect ghcr.io/noahkiss/workflows-selftest:selftest
+
+  # revision_command + skip_if_label: the first build publishes a revision
+  # unique to this run attempt; the two after it must find it and skip.
+  image-rev:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest-rev
+      context: selftest/docker
+      revision_command: echo "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      tags: |
+        type=raw,value=rev
+        type=raw,value=r-{revision_short}
+      labels: |
+        selftest.revision={revision}
+      build_args: |
+        REV={revision}
+      smoke_command: docker run --rm "$IMAGE" | grep -q "rev run-"
+
+  image-rev-skip:
+    needs: image-rev
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest-rev
+      context: selftest/docker
+      revision_command: echo "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      skip_if_label: selftest.revision
+      tags: |
+        type=raw,value=rev
+      labels: |
+        selftest.revision={revision}
+      # A skipped build must not deploy, so this must not post anything.
+      deploy_stack: selftest
+      listener_url: https://listener.invalid/listener/github
+    secrets:
+      webhook_secret: unused
+
+  image-rev-native-skip:
+    needs: image-rev
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ghcr-build-push.yml
+    with:
+      image: ghcr.io/noahkiss/workflows-selftest-rev
+      context: selftest/docker
+      native_runners: true
+      revision_command: echo "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      skip_if_label: selftest.revision
+      tags: |
+        type=raw,value=rev
+
+  image-rev-check:
+    needs: [image-rev, image-rev-skip, image-rev-native-skip]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - env:
+          BUILT: ${{ needs.image-rev.outputs.skipped }}
+          SKIP: ${{ needs.image-rev-skip.outputs.skipped }}
+          NATIVE_SKIP: ${{ needs.image-rev-native-skip.outputs.skipped }}
+          REVISION: ${{ needs.image-rev.outputs.revision }}
+          SKIP_REVISION: ${{ needs.image-rev-native-skip.outputs.revision }}
+          TAGS: ${{ needs.image-rev.outputs.tags }}
+        run: |
+          set -euo pipefail
+          echo "built=$BUILT skip=$SKIP native_skip=$NATIVE_SKIP revision=$REVISION"
+          [ "$BUILT" = false ]
+          [ "$SKIP" = true ]
+          [ "$NATIVE_SKIP" = true ]
+          [ "$REVISION" = "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]
+          [ "$SKIP_REVISION" = "$REVISION" ]
+          grep -qx "ghcr.io/noahkiss/workflows-selftest-rev:r-${REVISION:0:12}" <<< "$TAGS"
+
+  komodo-deploy-action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the stand-in listener
+        run: |
+          set -euo pipefail
+          nohup python3 selftest/komodo/listener.py "$RUNNER_TEMP/verdict" > "$RUNNER_TEMP/listener.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            if curl -s -o /dev/null http://127.0.0.1:8765/; then exit 0; fi
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/listener.log"
+          exit 1
+
+      - name: Deploy with the right secret
+        uses: ./actions/komodo-deploy
+        with:
+          stack: selftest
+          listener-url: http://127.0.0.1:8765/listener/github
+          webhook-secret: selftest-secret
+
+      - name: Check the listener accepted it
+        run: test "$(cat "$RUNNER_TEMP/verdict")" = ok
+
+      - name: Deploy with a wrong secret
+        id: wrong
+        continue-on-error: true
+        uses: ./actions/komodo-deploy
+        with:
+          stack: selftest
+          listener-url: http://127.0.0.1:8765/listener/github
+          webhook-secret: wrong-secret
+
+      - name: Deploy with no secret
+        id: empty
+        continue-on-error: true
+        uses: ./actions/komodo-deploy
+        with:
+          stack: selftest
+          listener-url: http://127.0.0.1:8765/listener/github
+          webhook-secret: ''
+
+      - name: Check both were refused
+        env:
+          WRONG: ${{ steps.wrong.outcome }}
+          EMPTY: ${{ steps.empty.outcome }}
+        run: |
+          set -euo pipefail
+          echo "wrong=$WRONG empty=$EMPTY"
+          [ "$WRONG" = failure ]
+          [ "$EMPTY" = failure ]
+          test "$(cat "$RUNNER_TEMP/verdict")" = bad
