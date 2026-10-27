@@ -14,9 +14,12 @@ on:
       listener_url:
         description: >-
           Base URL of the Komodo webhook listener, without a trailing slash,
-          for example https://hooks.example.com/listener/github
-        required: true
+          for example https://hooks.example.com/listener/github. The
+          komodo_listener_url secret takes precedence; one of the two is
+          required.
+        required: false
         type: string
+        default: ''
       ref:
         description: Git ref sent in the webhook payload.
         required: false
@@ -31,6 +34,12 @@ on:
       webhook_secret:
         description: Shared secret the listener verifies. Must match KOMODO_WEBHOOK_SECRET.
         required: true
+      komodo_listener_url:
+        description: >-
+          Base URL of the Komodo webhook listener, as a secret, so the run log
+          masks it. Repository variables print unmasked. Takes precedence over
+          the listener_url input.
+        required: false
 
 jobs:
   deploy:
@@ -47,6 +56,6 @@ jobs:
         uses: noahkiss/workflows/actions/komodo-deploy@main
         with:
           stack: ${{ inputs.stack }}
-          listener-url: ${{ inputs.listener_url }}
+          listener-url: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           ref: ${{ inputs.ref }}
           webhook-secret: ${{ secrets.webhook_secret }}

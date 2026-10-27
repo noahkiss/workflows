@@ -42,8 +42,9 @@ rewrites both the SHA and the comment. One merge here updates every caller.
 
 `.github/workflows/selftest.yml` calls the workflows and the `komodo-deploy`
 action against the fixtures in `selftest/` on every change to them. Add a job
-there for each new input. The deploy path posts to a stand-in listener on the
-runner, never to a real one.
+there for each new input. The deploy action posts to a stand-in listener on
+the runner, never to a real one. A called workflow runs on its own runner, so
+the `komodo_listener_url` secret path posts to an echo endpoint instead.
 
 ## Rules that apply to all of them
 
@@ -126,18 +127,21 @@ Replaces the inline deploy step copied into four repositories. It posts a signed
 synthetic push event to a Komodo webhook listener, which then redeploys one
 stack.
 
-The listener URL is a required input with no default. Keep it in a repository or
-organization variable.
+The listener URL has no default. Pass it as the `komodo_listener_url` secret,
+from a repository secret. A repository variable prints unmasked in the run log;
+a secret is masked. The `listener_url` input still works and is used when the
+secret is empty. The action never prints the URL either way.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
 | `stack` | yes | — | Komodo stack name |
-| `listener_url` | yes | — | Listener base URL, no trailing slash |
+| `listener_url` | no | `''` | Listener base URL, no trailing slash; used when the secret is empty |
 | `ref` | no | `refs/heads/main` | Git ref sent in the payload |
 
 | Secret | Required | Meaning |
 |---|---|---|
 | `webhook_secret` | yes | Shared secret; must match the listener's |
+| `komodo_listener_url` | one of it or `listener_url` | Listener base URL; takes precedence over the input |
 
 Permissions: none. The job declares `permissions: {}`.
 
@@ -150,13 +154,13 @@ the signing logic serves both. A job of your own can run it as a step:
       - uses: noahkiss/workflows/actions/komodo-deploy@main
         with:
           stack: my-stack
-          listener-url: ${{ vars.KOMODO_LISTENER_URL }}
+          listener-url: ${{ secrets.KOMODO_LISTENER_URL }}
           webhook-secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
 ```
 
 It signs the payload with HMAC-SHA256 and sends the hex digest in
-`X-Hub-Signature-256`. A non-2xx reply fails the job. The secret and the
-signature are never printed.
+`X-Hub-Signature-256`. A non-2xx reply fails the job. The secret, the
+signature and the listener URL are never printed. An empty URL fails at once.
 
 The post is attempted twice, 75 seconds apart, but only when the first failure
 is one a fresh runner can clear — a transport error, a 429, a 5xx, or a 403
@@ -173,9 +177,9 @@ jobs:
     uses: noahkiss/workflows/.github/workflows/komodo-deploy.yml@main
     with:
       stack: my-stack
-      listener_url: https://hooks.example.com/listener/github
     secrets:
       webhook_secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
+      komodo_listener_url: ${{ secrets.KOMODO_LISTENER_URL }}
 ```
 
 Deploy after the image is published, not on push — the image is still building
@@ -196,9 +200,9 @@ jobs:
     uses: noahkiss/workflows/.github/workflows/komodo-deploy.yml@main
     with:
       stack: my-stack
-      listener_url: ${{ vars.KOMODO_LISTENER_URL }}
     secrets:
       webhook_secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
+      komodo_listener_url: ${{ secrets.KOMODO_LISTENER_URL }}
 ```
 
 ---
@@ -225,7 +229,7 @@ Replaces the near-identical GHCR build in ten repositories. It builds
 | `revision_command` | no | `''` → none | Command printing the revision the image packages; see below |
 | `skip_if_label` | no | `''` → never skip | Label key compared with that revision; see below |
 | `deploy_stack` | no | `''` → no deploy | Komodo stack to redeploy after the push; see below |
-| `listener_url` | with `deploy_stack` | `''` | Komodo listener base URL, no trailing slash |
+| `listener_url` | with `deploy_stack`, unless the secret is set | `''` | Komodo listener base URL, no trailing slash |
 | `timeout_minutes` | no | `45` | Timeout of each build job |
 
 Default `tags`:
@@ -242,6 +246,7 @@ It logs in with `github.actor` and the job's `GITHUB_TOKEN`.
 | Secret | Required | Meaning |
 |---|---|---|
 | `webhook_secret` | with `deploy_stack` and `push` | Shared secret of the Komodo listener |
+| `komodo_listener_url` | with `deploy_stack`, unless the input is set | Listener base URL; takes precedence over `listener_url`. Prefer it: a secret is masked in the log |
 
 | Output | Meaning |
 |---|---|
@@ -343,8 +348,9 @@ as its last step, through `actions/komodo-deploy` (see `komodo-deploy.yml`
 above). With `native_runners` that is the merge job. A run that pushes nothing
 (`push: false`, or a build skipped by `skip_if_label`) deploys nothing.
 
-The job fails at its first step when `deploy_stack` is set without
-`listener_url`, or without the `webhook_secret` secret while `push` is true.
+The job fails at its first step when `deploy_stack` is set with neither the
+`komodo_listener_url` secret nor the `listener_url` input, or without the
+`webhook_secret` secret while `push` is true.
 
 **Gate the branch yourself**, by passing an empty stack off the default branch:
 
@@ -358,9 +364,9 @@ jobs:
     with:
       push: ${{ github.event_name != 'pull_request' }}
       deploy_stack: ${{ github.ref == 'refs/heads/main' && 'my-stack' || '' }}
-      listener_url: ${{ vars.KOMODO_LISTENER_URL }}
     secrets:
       webhook_secret: ${{ secrets.KOMODO_WEBHOOK_SECRET }}
+      komodo_listener_url: ${{ secrets.KOMODO_LISTENER_URL }}
 ```
 
 ### Packaging another project: `revision_command` and `skip_if_label`

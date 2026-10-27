@@ -2,8 +2,12 @@ name: Selftest
 
 # Calls each shared workflow and the komodo-deploy action against the small
 # fixtures in selftest/, so a change is proven here before callers take it
-# at @main. Nothing here posts to a real listener: the deploy path is checked
-# against a stand-in listener on the runner.
+# at @main. Nothing here posts to a real listener. The komodo-deploy action is
+# checked against a stand-in listener on the runner. A called workflow runs on
+# its own runner, which the stand-in cannot reach, so the komodo_listener_url
+# secret path is checked against an echo endpoint (httpbin.org/anything) that
+# answers 200 to any POST. Each of those calls also passes a listener_url input
+# that cannot resolve, so a green deploy proves the secret took precedence.
 
 on:
   push:
@@ -134,6 +138,12 @@ jobs:
       tags: |
         type=raw,value=selftest
       smoke_command: docker run --rm "$IMAGE"
+      # Deploy from the merge job, URL from the secret.
+      deploy_stack: selftest
+      listener_url: https://listener.invalid/listener/github
+    secrets:
+      webhook_secret: selftest-secret
+      komodo_listener_url: https://httpbin.org/anything/listener/github
 
   image-check:
     needs: image-native
@@ -170,6 +180,12 @@ jobs:
       build_args: |
         REV={revision}
       smoke_command: docker run --rm "$IMAGE" | grep -q "rev run-"
+      # Deploy from the build job, URL from the secret.
+      deploy_stack: selftest
+      listener_url: https://listener.invalid/listener/github
+    secrets:
+      webhook_secret: selftest-secret
+      komodo_listener_url: https://httpbin.org/anything/listener/github
 
   image-rev-skip:
     needs: image-rev
@@ -231,6 +247,27 @@ jobs:
           [ "$SKIP_REVISION" = "$REVISION" ]
           grep -qx "ghcr.io/noahkiss/workflows-selftest-rev:r-${REVISION:0:12}" <<< "$TAGS"
 
+  # The secret wins over the input.
+  komodo-deploy-secret:
+    permissions: {}
+    uses: ./.github/workflows/komodo-deploy.yml
+    with:
+      stack: selftest
+      listener_url: https://listener.invalid/listener/github
+    secrets:
+      webhook_secret: selftest-secret
+      komodo_listener_url: https://httpbin.org/anything/listener/github
+
+  # Existing callers pass only the input; that must keep working.
+  komodo-deploy-input:
+    permissions: {}
+    uses: ./.github/workflows/komodo-deploy.yml
+    with:
+      stack: selftest
+      listener_url: https://httpbin.org/anything/listener/github
+    secrets:
+      webhook_secret: selftest-secret
+
   komodo-deploy-action:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -278,13 +315,24 @@ jobs:
           listener-url: http://127.0.0.1:8765/listener/github
           webhook-secret: ''
 
-      - name: Check both were refused
+      - name: Deploy with no listener URL
+        id: nourl
+        continue-on-error: true
+        uses: ./actions/komodo-deploy
+        with:
+          stack: selftest
+          listener-url: ''
+          webhook-secret: selftest-secret
+
+      - name: Check all three were refused
         env:
           WRONG: ${{ steps.wrong.outcome }}
           EMPTY: ${{ steps.empty.outcome }}
+          NOURL: ${{ steps.nourl.outcome }}
         run: |
           set -euo pipefail
-          echo "wrong=$WRONG empty=$EMPTY"
+          echo "wrong=$WRONG empty=$EMPTY nourl=$NOURL"
           [ "$WRONG" = failure ]
           [ "$EMPTY" = failure ]
+          [ "$NOURL" = failure ]
           test "$(cat "$RUNNER_TEMP/verdict")" = bad

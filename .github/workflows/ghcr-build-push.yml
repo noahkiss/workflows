@@ -130,7 +130,8 @@ on:
       listener_url:
         description: >-
           Base URL of the Komodo webhook listener, without a trailing slash.
-          Required when deploy_stack is set.
+          The komodo_listener_url secret takes precedence. One of the two is
+          required when deploy_stack is set.
         required: false
         type: string
         default: ''
@@ -144,6 +145,12 @@ on:
         description: >-
           Shared secret the Komodo listener verifies. Required when
           deploy_stack is set and push is true.
+        required: false
+      komodo_listener_url:
+        description: >-
+          Base URL of the Komodo webhook listener, as a secret, so the run log
+          masks it. Repository variables print unmasked. Takes precedence over
+          the listener_url input.
         required: false
     outputs:
       digest:
@@ -188,7 +195,7 @@ jobs:
       - name: Check inputs
         env:
           DEPLOY_STACK: ${{ inputs.deploy_stack }}
-          LISTENER_URL: ${{ inputs.listener_url }}
+          LISTENER_URL: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
           PUSH: ${{ inputs.push }}
           REVISION_COMMAND: ${{ inputs.revision_command }}
@@ -198,7 +205,7 @@ jobs:
           fail=0
           if [ -n "$DEPLOY_STACK" ]; then
             if [ -z "$LISTENER_URL" ]; then
-              echo "::error::deploy_stack is set, so listener_url is required"; fail=1
+              echo "::error::deploy_stack is set, so the komodo_listener_url secret or the listener_url input is required"; fail=1
             fi
             if [ "$PUSH" = true ] && [ -z "$WEBHOOK_SECRET" ]; then
               echo "::error::deploy_stack is set, so the webhook_secret secret is required. Name it under secrets: in the calling job."; fail=1
@@ -379,7 +386,7 @@ jobs:
         uses: noahkiss/workflows/actions/komodo-deploy@main
         with:
           stack: ${{ inputs.deploy_stack }}
-          listener-url: ${{ inputs.listener_url }}
+          listener-url: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           webhook-secret: ${{ secrets.webhook_secret }}
 
   # native_runners: plan -> one build per platform on its own runner -> merge.
@@ -411,7 +418,7 @@ jobs:
       - name: Check inputs
         env:
           DEPLOY_STACK: ${{ inputs.deploy_stack }}
-          LISTENER_URL: ${{ inputs.listener_url }}
+          LISTENER_URL: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
           PUSH: ${{ inputs.push }}
           REVISION_COMMAND: ${{ inputs.revision_command }}
@@ -421,7 +428,7 @@ jobs:
           fail=0
           if [ -n "$DEPLOY_STACK" ]; then
             if [ -z "$LISTENER_URL" ]; then
-              echo "::error::deploy_stack is set, so listener_url is required"; fail=1
+              echo "::error::deploy_stack is set, so the komodo_listener_url secret or the listener_url input is required"; fail=1
             fi
             if [ "$PUSH" = true ] && [ -z "$WEBHOOK_SECRET" ]; then
               echo "::error::deploy_stack is set, so the webhook_secret secret is required. Name it under secrets: in the calling job."; fail=1
@@ -731,5 +738,5 @@ jobs:
         uses: noahkiss/workflows/actions/komodo-deploy@main
         with:
           stack: ${{ inputs.deploy_stack }}
-          listener-url: ${{ inputs.listener_url }}
+          listener-url: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           webhook-secret: ${{ secrets.webhook_secret }}

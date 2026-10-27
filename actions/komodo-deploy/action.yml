@@ -12,7 +12,7 @@ inputs:
   listener-url:
     description: >-
       Base URL of the Komodo webhook listener, without a trailing slash, for
-      example https://hooks.example.com/listener/github
+      example https://hooks.example.com/listener/github. Never printed.
     required: true
   ref:
     description: Git ref sent in the webhook payload.
@@ -36,7 +36,7 @@ runs:
         set -euo pipefail
 
         [ -n "$STACK" ] || { echo "::error::stack is empty"; exit 1; }
-        [ -n "$LISTENER_URL" ] || { echo "::error::listener_url is empty"; exit 1; }
+        [ -n "$LISTENER_URL" ] || { echo "::error::the listener URL is empty: pass the komodo_listener_url secret or the listener_url input"; exit 1; }
         if [ -z "$WEBHOOK_SECRET" ]; then
           echo "::error::webhook_secret is empty. Name it under secrets: in the calling job."
           exit 1
@@ -58,11 +58,13 @@ runs:
         max_attempts=2
         backoff=75
 
-        echo "POST ${url}"
+        # Never print the URL: a caller may pass it as a secret to keep it out
+        # of the log, and the listener host is fleet detail either way.
+        echo "POST <listener>/stack/${STACK}/deploy"
         attempt=1
         while true; do
           rc=0
-          status=$(curl --silent --show-error --location \
+          status=$(curl --silent --location \
             --output "$response" --write-out '%{http_code}' \
             --max-time 60 \
             --request POST "$url" \
@@ -105,5 +107,8 @@ runs:
         done
 
         echo "Deploy request failed." >&2
-        head -c 2000 "$response" >&2 || true
+        # An edge error page can name the listener host; mask it.
+        host="${LISTENER_URL#*://}"; host="${host%%/*}"
+        body="$(head -c 2000 "$response" || true)"
+        printf '%s\n' "${body//"$host"/<listener-host>}" >&2
         exit 1
