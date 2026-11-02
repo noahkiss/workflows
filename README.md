@@ -733,7 +733,7 @@ The log shows each xcodebuild's errors, signing warnings, failed test cases and
 verdict; the full log goes to the artifact when the job fails. The SwiftPM
 cache holds `~/Library/Caches/org.swift.swiftpm` (for `swift test`) and the
 cloned packages folder every xcodebuild uses (`-clonedSourcePackagesDirPath`).
-Its key carries the runner OS and arch, the Xcode name and the hash of
+Its key carries the runner OS and arch, the Xcode build version and the hash of
 `spm-cache-key-file`; a miss restores the newest entry with the same prefix.
 It saves when the key missed, also after a failed build, never from a tag.
 The job's concurrency group is
@@ -864,9 +864,15 @@ map), then:
   `source=Notarized Developer ID` from `spctl`.
 - `export-method: ''`: archive only.
 
+`archive-path` takes the `archive-path` output of an earlier call and exports
+that archive without building again. So a job can archive with
+`export-method: ''`, check the archive in its own step, then export and upload
+in a second call.
+
 | Input | Required | Default | Meaning |
 |---|---|---|---|
-| `scheme` | yes | — | Scheme to archive |
+| `scheme` | to archive | `''` | Scheme to archive |
+| `archive-path` | no | `''` | An existing `.xcarchive` to export instead of archiving |
 | `project` | no | `''` | `.xcodeproj` or `.xcworkspace` |
 | `working-directory` | no | `.` | Folder to run in |
 | `configuration` | no | `Release` | Build configuration |
@@ -941,6 +947,17 @@ jobs:
           xcconfig: ${{ steps.signing.outputs.xcconfig }}
           marketing-version: '1.2.0'
           build-number: ${{ github.run_number }}
+          export-method: ''
+      - name: Check export compliance
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive-path }}
+        run: |
+          test "$(plutil -extract ITSAppUsesNonExemptEncryption raw -o - \
+            "$ARCHIVE/Products/Applications/AppiOS.app/Info.plist")" = false
+      - id: upload
+        uses: noahkiss/workflows/actions/xcode-archive-upload@main
+        with:
+          archive-path: ${{ steps.archive.outputs.archive-path }}
           team-id: ${{ vars.APPLE_TEAM_ID }}
           provisioning-profiles: ${{ steps.signing.outputs.profiles }}
           api-key-p8: ${{ secrets.UPLOAD_KEY_P8 }}
@@ -954,7 +971,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ios-logs
-          path: ${{ steps.archive.outputs.log-dir }}
+          path: ${{ steps.upload.outputs.log-dir || steps.archive.outputs.log-dir }}
           if-no-files-found: ignore
 ```
 

@@ -5,7 +5,8 @@
 # Runs in CI through action.yml. Every input is an environment variable:
 #
 #   XAU_PROJECT              .xcodeproj or .xcworkspace; empty lets xcodebuild find one
-#   XAU_SCHEME               scheme to archive (required)
+#   XAU_SCHEME               scheme to archive (required unless XAU_ARCHIVE is set)
+#   XAU_ARCHIVE              an existing .xcarchive to export instead of archiving
 #   XAU_CONFIGURATION        build configuration (default Release)
 #   XAU_DESTINATION          archive destination (default generic/platform=iOS)
 #   XAU_XCCONFIG             signing xcconfig, e.g. from xcode-match-signing
@@ -32,14 +33,23 @@ fail() { echo "::error::$*" >&2; exit 1; }
 trim() { local s="$1"; s="${s%$'\r'}"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
 
 [ "$(uname -s)" = Darwin ] || fail "xcode-archive-upload needs a macOS runner"
-[ -n "${XAU_SCHEME:-}" ] || fail "scheme is required"
+existing="${XAU_ARCHIVE:-}"
+[ -n "${XAU_SCHEME:-}" ] || [ -n "$existing" ] || fail "scheme is required"
 
 temp="${RUNNER_TEMP:?RUNNER_TEMP is not set}"
 work="$temp/xcode-archive-upload"
 logs="$work/logs"
 keys="$work/keys"
-archive="$work/${XAU_SCHEME//[^A-Za-z0-9._-]/_}.xcarchive"
 export_path="$work/export"
+# Archives live beside the work folder, so a second call can export one.
+if [ -n "$existing" ]; then
+  [ -d "$existing" ] || fail "no archive at $existing"
+  archive=$(cd "$existing" && pwd)
+else
+  archive="$temp/xcode-archives/${XAU_SCHEME//[^A-Za-z0-9._-]/_}.xcarchive"
+  rm -rf -- "$archive"
+  mkdir -p "$temp/xcode-archives"
+fi
 rm -rf -- "$work"
 mkdir -p "$logs"
 trap 'rm -rf -- "$keys"' EXIT
@@ -83,30 +93,32 @@ xcb() { # log name, then xcodebuild arguments
   fi
 }
 
-args=()
-case "${XAU_PROJECT:-}" in
-  '') ;;
-  *.xcworkspace) args+=(-workspace "$XAU_PROJECT") ;;
-  *) args+=(-project "$XAU_PROJECT") ;;
-esac
-args+=(-scheme "$XAU_SCHEME" -configuration "${XAU_CONFIGURATION:-Release}"
-  -destination "${XAU_DESTINATION:-generic/platform=iOS}" -archivePath "$archive")
-if [ -n "${XAU_XCCONFIG:-}" ]; then
-  [ -f "$XAU_XCCONFIG" ] || fail "no xcconfig at $XAU_XCCONFIG"
-  args+=(-xcconfig "$XAU_XCCONFIG")
-fi
-[ -n "${XAU_PACKAGES_DIR:-}" ] && args+=(-clonedSourcePackagesDirPath "$XAU_PACKAGES_DIR")
-[ -n "${XAU_MARKETING_VERSION:-}" ] && args+=("MARKETING_VERSION=$XAU_MARKETING_VERSION")
-[ -n "${XAU_BUILD_NUMBER:-}" ] && args+=("CURRENT_PROJECT_VERSION=$XAU_BUILD_NUMBER")
-while IFS= read -r arg; do
-  arg=$(trim "$arg")
-  [ -n "$arg" ] && args+=("$arg")
-done <<< "${XAU_XCODEBUILD_ARGS:-}"
+if [ -z "$existing" ]; then
+  args=()
+  case "${XAU_PROJECT:-}" in
+    '') ;;
+    *.xcworkspace) args+=(-workspace "$XAU_PROJECT") ;;
+    *) args+=(-project "$XAU_PROJECT") ;;
+  esac
+  args+=(-scheme "$XAU_SCHEME" -configuration "${XAU_CONFIGURATION:-Release}"
+    -destination "${XAU_DESTINATION:-generic/platform=iOS}" -archivePath "$archive")
+  if [ -n "${XAU_XCCONFIG:-}" ]; then
+    [ -f "$XAU_XCCONFIG" ] || fail "no xcconfig at $XAU_XCCONFIG"
+    args+=(-xcconfig "$XAU_XCCONFIG")
+  fi
+  [ -n "${XAU_PACKAGES_DIR:-}" ] && args+=(-clonedSourcePackagesDirPath "$XAU_PACKAGES_DIR")
+  [ -n "${XAU_MARKETING_VERSION:-}" ] && args+=("MARKETING_VERSION=$XAU_MARKETING_VERSION")
+  [ -n "${XAU_BUILD_NUMBER:-}" ] && args+=("CURRENT_PROJECT_VERSION=$XAU_BUILD_NUMBER")
+  while IFS= read -r arg; do
+    arg=$(trim "$arg")
+    [ -n "$arg" ] && args+=("$arg")
+  done <<< "${XAU_XCODEBUILD_ARGS:-}"
 
-echo "::group::Archive $XAU_SCHEME"
-xcb archive "${args[@]}" archive
-echo "::endgroup::"
-[ -d "$archive" ] || fail "xcodebuild reported success but wrote no archive"
+  echo "::group::Archive $XAU_SCHEME"
+  xcb archive "${args[@]}" archive
+  echo "::endgroup::"
+  [ -d "$archive" ] || fail "xcodebuild reported success but wrote no archive"
+fi
 out archive-path "$archive"
 
 [ -n "$method" ] || exit 0

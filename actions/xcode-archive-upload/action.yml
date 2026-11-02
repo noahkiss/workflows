@@ -11,8 +11,15 @@ inputs:
     required: false
     default: ''
   scheme:
-    description: Scheme to archive.
-    required: true
+    description: Scheme to archive. Not needed with archive-path.
+    required: false
+    default: ''
+  archive-path:
+    description: >-
+      An existing .xcarchive (the archive-path output of an earlier call) to
+      export instead of archiving, so a check can run between the two calls.
+    required: false
+    default: ''
   configuration:
     description: Build configuration.
     required: false
@@ -108,6 +115,7 @@ runs:
       env:
         XAU_PROJECT: ${{ inputs.project }}
         XAU_SCHEME: ${{ inputs.scheme }}
+        XAU_ARCHIVE: ${{ inputs.archive-path }}
         XAU_CONFIGURATION: ${{ inputs.configuration }}
         XAU_DESTINATION: ${{ inputs.destination }}
         XAU_XCCONFIG: ${{ inputs.xcconfig }}

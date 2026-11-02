@@ -252,6 +252,25 @@ jobs:
           [ "$(plutil -extract CFBundleShortVersionString raw -o - "$plist")" = 2.3.4 ]
           [ "$(plutil -extract CFBundleVersion raw -o - "$plist")" = 202611010000 ]
 
+      # A second call takes the first one's archive and builds nothing.
+      - name: Reuse the archive
+        id: again
+        uses: ./actions/xcode-archive-upload
+        with:
+          archive-path: ${{ steps.archive.outputs.archive-path }}
+          export-method: ''
+
+      - name: Check the reuse
+        env:
+          FIRST: ${{ steps.archive.outputs.archive-path }}
+          SECOND: ${{ steps.again.outputs.archive-path }}
+          LOGS: ${{ steps.again.outputs.log-dir }}
+        run: |
+          set -euo pipefail
+          [ "$FIRST" = "$SECOND" ]
+          [ -d "$SECOND/Products/Applications/SelftestMac.app" ]
+          [ -z "$(ls -A "$LOGS")" ]
+
   rust:
     permissions:
       contents: read
