@@ -604,8 +604,19 @@ The shared Go gate: Go from the module's version file, an optional `gofmt` and
 | `generate-check` | no | `false` | Run `go generate ./...` and fail when it changes or adds a file |
 | `commands` | no | `go vet ./...` and `go test ./...` | Commands, one per line, in order |
 | `timeout-minutes` | no | `20` | Job timeout |
+| `runner` | no | `ubuntu-latest` | Runner label, e.g. `ubuntu-24.04-arm` or `macos-26` |
+| `mise` | no | `false` | Install the tools in `mise.toml` (in `working-directory`) with `jdx/mise-action`, e.g. a C toolchain the commands need. It runs before setup-go, so setup-go's Go wins over a `go` entry in `mise.toml`. Its cache saves on the default branch only |
+| `cache-path` | no | `''` | One extra path to cache, relative to `working-directory`, e.g. a library the commands build. Needs `cache-key` |
+| `cache-key` | no | `''` | Key for `cache-path`. Restored on every run; saved after the commands on the default branch only, when the key missed, even if a command failed |
+| `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
 
 Secrets: none.
+
+Each command runs with stdin from `/dev/null`, so a command that reads stdin cannot swallow the
+commands after it. The job's concurrency group is
+`go-ci-<repo>-<calling workflow>-<working-directory>-<runner>-<ref>`. Two workflows of
+one repo (CI on main and a nightly schedule, say) or two runners in one run no longer
+cancel each other.
 
 Permissions the calling job must grant:
 

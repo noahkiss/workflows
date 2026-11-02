@@ -78,6 +78,32 @@ jobs:
           path: report
       - run: test -f report/index.html
 
+  # Defaults only: the shape every existing go-ci caller uses.
+  go:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/go-ci.yml
+    with:
+      working-directory: selftest/go
+
+  # Every newer input at once, on macOS. Its runner differs from the job above,
+  # so the two share no concurrency group and both finish.
+  go-extras:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/go-ci.yml
+    with:
+      working-directory: selftest/go
+      runner: macos-26
+      mise: true
+      cache-path: .selftest-cache
+      cache-key: go-ci-selftest-v1
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      commands: |
+        jq --version
+        mkdir -p .selftest-cache && echo built > .selftest-cache/out
+        go test ./...
+
   rust:
     permissions:
       contents: read
