@@ -61,7 +61,7 @@ on:
         description: >-
           One `xcodebuild test` per line, the same form as builds. The
           destination `ios-simulator` means an available iPhone simulator of
-          the newest iOS runtime on the runner.
+          the newest iOS runtime the selected Xcode's SDK supports.
         required: false
         type: string
         default: ''
@@ -81,12 +81,13 @@ on:
         default: ''
       netrc:
         description: >-
-          Write ~/.netrc for api.github.com with the job token, so SwiftPM
-          binary downloads from GitHub do not hit the anonymous rate limit.
+          Write ~/.netrc for api.github.com with the job token, for SwiftPM
+          calls to the GitHub API (package collection metadata). It does not
+          cover git clones or binary downloads from github.com release URLs.
           Removed when the job ends.
         required: false
         type: boolean
-        default: true
+        default: false
       logs-name:
         description: >-
           Artifact name for the full logs, uploaded when the job fails. Give
@@ -124,6 +125,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # DEVELOPER_DIR picks the Xcode for every later step without sudo or
       # xcode-select, so the runner's global choice is never changed.
@@ -215,6 +218,7 @@ jobs:
           eval "$GENERATE" </dev/null
 
       - name: Builds and tests
+        id: builds
         if: inputs.builds != '' || inputs.tests != ''
         env:
           BUILDS: ${{ inputs.builds }}
@@ -238,19 +242,26 @@ jobs:
             *) project=(-project "$PROJECT") ;;
           esac
 
-          # The newest iOS runtime's first available iPhone, as id=<udid>.
+          # The first iPhone by name of the newest iOS runtime no newer than
+          # the selected Xcode's simulator SDK, as id=<udid>. Runtimes are
+          # system-wide, so a newer Xcode on the image can leave a runtime
+          # this Xcode cannot test on.
           ios_simulator() {
-            xcrun simctl list devices available --json | python3 -I -c '
-          import json, re, sys
+            local sdk
+            sdk=$(xcrun --sdk iphonesimulator --show-sdk-version) || return 1
+            xcrun simctl list devices available --json | SDK="$sdk" python3 -I -c '
+          import json, os, re, sys
           devices = json.load(sys.stdin)["devices"]
+          sdk = [int(n) for n in re.findall(r"\d+", os.environ["SDK"])]
           def version(runtime):
               return [int(n) for n in re.findall(r"\d+", runtime.rsplit(".", 1)[-1])]
-          for runtime in sorted((r for r in devices if ".iOS-" in r), key=version, reverse=True):
-              for device in devices[runtime]:
+          runtimes = [r for r in devices if ".iOS-" in r and version(r) <= sdk]
+          for runtime in sorted(runtimes, key=version, reverse=True):
+              for device in sorted(devices[runtime], key=lambda d: (d["name"], d["udid"])):
                   if device["name"].startswith("iPhone"):
                       print("id=" + device["udid"])
                       sys.exit(0)
-          sys.exit("no available iPhone simulator on this runner")
+          sys.exit("no available iPhone simulator for the iOS " + os.environ["SDK"] + " SDK on this runner")
           '
           }
 
@@ -302,13 +313,18 @@ jobs:
           path: ${{ runner.temp }}/xcode-ci-logs
           if-no-files-found: ignore
 
-      # Saved even when a build failed, so the checkouts are not lost to a
-      # failing test. Never from a tag: a tag's cache is visible to that tag only.
+      # Saved when the builds and tests ran, even when one failed, so the
+      # checkouts are not lost to a failing test; with no builds or tests, only
+      # on success. Not after an earlier failure: the packages folder may be
+      # empty, and an exact-key entry is never saved again. Never from a tag:
+      # a tag's cache is visible to that tag only.
       - name: Save the SwiftPM cache
         if: >-
           !cancelled() && steps.spm-key.outputs.key != ''
           && steps.spm-cache.outputs.cache-hit != 'true'
           && !startsWith(github.ref, 'refs/tags/')
+          && (steps.builds.outcome == 'success' || steps.builds.outcome == 'failure'
+          || (inputs.builds == '' && inputs.tests == '' && success()))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

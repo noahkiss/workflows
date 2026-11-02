@@ -719,10 +719,10 @@ which a public repository runs free and a private one pays 10x for.
 | `generate` | no | `''` | Command that makes the project, e.g. `xcodegen generate` or `scripts/generate.sh` |
 | `project` | no | `''` | `.xcodeproj` or `.xcworkspace` for project lines; empty lets xcodebuild find it |
 | `builds` | no | `''` | One build per line: `scheme \| destination`, or `scheme \| destination \| package folder` to build a Swift package's scheme in that folder |
-| `tests` | no | `''` | One `xcodebuild test` per line, the same form. The destination `ios-simulator` picks an available iPhone of the newest iOS runtime |
+| `tests` | no | `''` | One `xcodebuild test` per line, the same form. The destination `ios-simulator` picks the first iPhone, by name, of the newest iOS runtime no newer than the selected Xcode's simulator SDK |
 | `xcodebuild-args` | no | `''` | Extra arguments for every xcodebuild, one per line, e.g. `CODE_SIGNING_ALLOWED=NO` |
 | `spm-cache-key-file` | no | `''` → no cache | Glob of the `Package.resolved` file(s) the SwiftPM cache keys on, from the repository root |
-| `netrc` | no | `true` | Write `~/.netrc` for `api.github.com` with the job token, so SwiftPM binary downloads skip the anonymous rate limit. Removed at the end |
+| `netrc` | no | `false` | Write `~/.netrc` for `api.github.com` with the job token, for SwiftPM calls to the GitHub API (package collection metadata). It does not cover git clones or binary downloads from `github.com` release URLs. Removed at the end |
 | `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
 | `timeout-minutes` | no | `60` | Job timeout |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
@@ -735,7 +735,10 @@ cache holds `~/Library/Caches/org.swift.swiftpm` (for `swift test`) and the
 cloned packages folder every xcodebuild uses (`-clonedSourcePackagesDirPath`).
 Its key carries the runner OS and arch, the Xcode build version and the hash of
 `spm-cache-key-file`; a miss restores the newest entry with the same prefix.
-It saves when the key missed, also after a failed build, never from a tag.
+It saves when the key missed and the builds and tests ran, also when one
+failed; with no `builds` or `tests`, only when the job succeeded. It never
+saves after an earlier step failed (the packages folder may be empty, and an
+exact-key entry is not saved again), and never from a tag.
 The job's concurrency group is
 `xcode-ci-<repo>-<calling workflow>-<working-directory>-<ref>`.
 
