@@ -81,13 +81,12 @@ on:
         default: ''
       netrc:
         description: >-
-          Write ~/.netrc for api.github.com with the job token, for SwiftPM
-          calls to the GitHub API (package collection metadata). It does not
-          cover git clones or binary downloads from github.com release URLs.
-          Removed when the job ends.
+          Write a ~/.netrc for api.github.com with the job token. Callers with
+          SwiftPM binary targets from GitHub saw 403s from the anonymous rate
+          limit without it. Removed when the job ends.
         required: false
         type: boolean
-        default: false
+        default: true
       logs-name:
         description: >-
           Artifact name for the full logs, uploaded when the job fails. Give

@@ -123,7 +123,6 @@ jobs:
       tests: |
         Kit | ios-simulator | Kit
       spm-cache-key-file: selftest/xcode/Kit/Package.swift
-      netrc: true
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
       timeout-minutes: 30
 

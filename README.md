@@ -722,7 +722,7 @@ which a public repository runs free and a private one pays 10x for.
 | `tests` | no | `''` | One `xcodebuild test` per line, the same form. The destination `ios-simulator` picks the first iPhone, by name, of the newest iOS runtime no newer than the selected Xcode's simulator SDK |
 | `xcodebuild-args` | no | `''` | Extra arguments for every xcodebuild, one per line, e.g. `CODE_SIGNING_ALLOWED=NO` |
 | `spm-cache-key-file` | no | `''` → no cache | Glob of the `Package.resolved` file(s) the SwiftPM cache keys on, from the repository root |
-| `netrc` | no | `false` | Write `~/.netrc` for `api.github.com` with the job token, for SwiftPM calls to the GitHub API (package collection metadata). It does not cover git clones or binary downloads from `github.com` release URLs. Removed at the end |
+| `netrc` | no | `true` | Write a `~/.netrc` for `api.github.com` with the job token. Callers with SwiftPM binary targets from GitHub saw 403s from the anonymous rate limit without it. Removed at the end |
 | `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
 | `timeout-minutes` | no | `60` | Job timeout |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
