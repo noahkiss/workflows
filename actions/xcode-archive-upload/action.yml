@@ -1,0 +1,127 @@
+name: Xcode archive and upload
+description: >-
+  Archive an Xcode scheme with a signing xcconfig, export it with manual
+  signing and a provisioningProfiles map, then upload it to App Store Connect
+  (app-store-connect) or notarize and staple it (developer-id), with an App
+  Store Connect API key. With no export-method it archives only.
+
+inputs:
+  project:
+    description: The .xcodeproj or .xcworkspace. Empty lets xcodebuild find the one in the working directory.
+    required: false
+    default: ''
+  scheme:
+    description: Scheme to archive.
+    required: true
+  configuration:
+    description: Build configuration.
+    required: false
+    default: Release
+  destination:
+    description: Archive destination, e.g. generic/platform=iOS or generic/platform=macOS.
+    required: false
+    default: generic/platform=iOS
+  xcconfig:
+    description: Signing xcconfig, e.g. the xcconfig output of xcode-match-signing.
+    required: false
+    default: ''
+  marketing-version:
+    description: MARKETING_VERSION for the archive. Empty keeps the project's.
+    required: false
+    default: ''
+  build-number:
+    description: CURRENT_PROJECT_VERSION for the archive. Empty keeps the project's. App Store Connect needs it to grow.
+    required: false
+    default: ''
+  xcodebuild-args:
+    description: Extra archive arguments, one per line, e.g. ARCHS=arm64.
+    required: false
+    default: ''
+  packages-dir:
+    description: -clonedSourcePackagesDirPath, so a SwiftPM cache can serve the archive.
+    required: false
+    default: ''
+  export-method:
+    description: >-
+      app-store-connect, release-testing, enterprise, debugging or
+      developer-id. Empty archives and stops.
+    required: false
+    default: app-store-connect
+  team-id:
+    description: Apple team id, for the export.
+    required: false
+    default: ''
+  signing-certificate:
+    description: Export certificate. Empty derives it from the method.
+    required: false
+    default: ''
+  provisioning-profiles:
+    description: JSON object from bundle id to profile name, e.g. the profiles output of xcode-match-signing.
+    required: false
+    default: '{}'
+  upload:
+    description: app-store-connect only. true uploads the build; false exports the .ipa to disk.
+    required: false
+    default: 'true'
+  notarize:
+    description: developer-id only. true notarizes, staples and checks the exported app.
+    required: false
+    default: 'true'
+  working-directory:
+    description: Folder to run in.
+    required: false
+    default: .
+  api-key-p8:
+    description: App Store Connect API private key (.p8 PEM text). Required to upload or notarize.
+    required: false
+    default: ''
+  api-key-id:
+    description: The API key's id.
+    required: false
+    default: ''
+  api-key-issuer-id:
+    description: The API key's issuer id.
+    required: false
+    default: ''
+
+outputs:
+  archive-path:
+    description: Path of the .xcarchive.
+    value: ${{ steps.archive.outputs.archive-path }}
+  export-path:
+    description: Folder of the export, empty with no export-method.
+    value: ${{ steps.archive.outputs.export-path }}
+  app-path:
+    description: developer-id only. The exported .app.
+    value: ${{ steps.archive.outputs.app-path }}
+  log-dir:
+    description: Folder of the full xcodebuild logs, for an upload-artifact step.
+    value: ${{ steps.archive.outputs.log-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Archive, export and upload
+      id: archive
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        XAU_PROJECT: ${{ inputs.project }}
+        XAU_SCHEME: ${{ inputs.scheme }}
+        XAU_CONFIGURATION: ${{ inputs.configuration }}
+        XAU_DESTINATION: ${{ inputs.destination }}
+        XAU_XCCONFIG: ${{ inputs.xcconfig }}
+        XAU_MARKETING_VERSION: ${{ inputs.marketing-version }}
+        XAU_BUILD_NUMBER: ${{ inputs.build-number }}
+        XAU_XCODEBUILD_ARGS: ${{ inputs.xcodebuild-args }}
+        XAU_PACKAGES_DIR: ${{ inputs.packages-dir }}
+        XAU_METHOD: ${{ inputs.export-method }}
+        XAU_TEAM_ID: ${{ inputs.team-id }}
+        XAU_SIGNING_CERTIFICATE: ${{ inputs.signing-certificate }}
+        XAU_PROFILES: ${{ inputs.provisioning-profiles }}
+        XAU_UPLOAD: ${{ inputs.upload }}
+        XAU_NOTARIZE: ${{ inputs.notarize }}
+        ASC_KEY_P8: ${{ inputs.api-key-p8 }}
+        ASC_KEY_ID: ${{ inputs.api-key-id }}
+        ASC_ISSUER_ID: ${{ inputs.api-key-issuer-id }}
+      run: '"$GITHUB_ACTION_PATH/archive-upload.sh"'
