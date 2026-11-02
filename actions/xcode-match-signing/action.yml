@@ -1,0 +1,94 @@
+name: Xcode match signing
+description: >-
+  Install signing certificates and provisioning profiles from a fastlane match
+  store, read-only, over SSH with a deploy key, into a throwaway keychain, and
+  write a manual-signing xcconfig for xcodebuild. Never creates or changes
+  anything in the Apple Developer portal or the store. Run it again with
+  cleanup true in an `if: always()` step to delete the keychain and keys.
+
+inputs:
+  team-id:
+    description: Apple team id.
+    required: false
+    default: ''
+  profiles:
+    description: >-
+      One match call per line: `<type> <platform> <bundle id>[,<bundle id>...]`,
+      e.g. `appstore ios com.example.app,com.example.app.widgets`. Types:
+      appstore, adhoc, development, developer_id, enterprise. Platforms: ios,
+      macos, catalyst, tvos, visionos. Add `certificates-only` as a fourth word
+      to install the certificate and skip profiles.
+    required: false
+    default: ''
+  match-git-url:
+    description: SSH URL of the match store. Pass it from a secret; it names a private repository.
+    required: false
+    default: ''
+  match-password:
+    description: The store's passphrase (MATCH_PASSWORD).
+    required: false
+    default: ''
+  match-deploy-key:
+    description: Private SSH key with read access to the store.
+    required: false
+    default: ''
+  git-branch:
+    description: The store's branch. match's own default is master.
+    required: false
+    default: main
+  identity:
+    description: >-
+      Signing identity for the xcconfig. Empty derives it from the type:
+      Apple Distribution, Apple Development or Developer ID Application.
+    required: false
+    default: ''
+  xcconfig-extra:
+    description: Lines appended to the generated xcconfig, e.g. a build setting that names a profile.
+    required: false
+    default: ''
+  fastlane:
+    description: The fastlane command, e.g. `bundle exec fastlane` after ruby/setup-ruby.
+    required: false
+    default: fastlane
+  known-hosts:
+    description: known_hosts line(s) for the store's SSH host. The default is GitHub's published ed25519 key.
+    required: false
+    default: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+  cleanup:
+    description: true deletes the keychain, the key folder and the xcconfig, and does nothing else.
+    required: false
+    default: 'false'
+
+outputs:
+  keychain:
+    description: Path of the throwaway keychain.
+    value: ${{ steps.match.outputs.keychain }}
+  xcconfig:
+    description: Path of the manual-signing xcconfig, for xcodebuild -xcconfig.
+    value: ${{ steps.match.outputs.xcconfig }}
+  identity:
+    description: The signing identity the xcconfig uses.
+    value: ${{ steps.match.outputs.identity }}
+  profiles:
+    description: JSON object from bundle id to profile name, for an export plist.
+    value: ${{ steps.match.outputs.profiles }}
+
+runs:
+  using: composite
+  steps:
+    - name: Match, read-only
+      id: match
+      shell: bash
+      env:
+        XMS_CLEANUP: ${{ inputs.cleanup }}
+        XMS_TEAM_ID: ${{ inputs.team-id }}
+        XMS_PROFILES: ${{ inputs.profiles }}
+        XMS_IDENTITY: ${{ inputs.identity }}
+        XMS_GIT_BRANCH: ${{ inputs.git-branch }}
+        XMS_FASTLANE: ${{ inputs.fastlane }}
+        XMS_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        XMS_XCCONFIG_EXTRA: ${{ inputs.xcconfig-extra }}
+        MATCH_GIT_URL: ${{ inputs.match-git-url }}
+        MATCH_PASSWORD: ${{ inputs.match-password }}
+        MATCH_DEPLOY_KEY: ${{ inputs.match-deploy-key }}
+      run: '"$GITHUB_ACTION_PATH/match-signing.sh"'
