@@ -870,7 +870,8 @@ map), then:
 `archive-path` takes the `archive-path` output of an earlier call and exports
 that archive without building again. So a job can archive with
 `export-method: ''`, check the archive in its own step, then export and upload
-in a second call.
+in a second call. Calls in one job share `log-dir`: a later call keeps the
+earlier calls' logs.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
@@ -981,7 +982,9 @@ jobs:
 A Mac job is the same with `profiles: developer_id macos com.example.mac
 certificates-only` (no profile needed when the app has no entitlement that
 asks for one), `destination: generic/platform=macOS`, `xcodebuild-args:
-ARCHS=arm64` and `export-method: developer-id`.
+ARCHS=arm64` and `export-method: developer-id`. Mac App Store export is not
+supported yet: match installs no Mac Installer Distribution certificate, and
+the export writes no installer signing certificate.
 
 ---
 

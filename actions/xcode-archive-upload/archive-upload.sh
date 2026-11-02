@@ -50,7 +50,9 @@ else
   rm -rf -- "$archive"
   mkdir -p "$temp/xcode-archives"
 fi
-rm -rf -- "$work"
+# Clear what an earlier call left, but keep its logs: a job that archives,
+# checks, then exports and uploads in a second call keeps the archive log.
+rm -rf -- "$keys" "$export_path" "$work/ExportOptions.plist" "$work/notarize.zip"
 mkdir -p "$logs"
 trap 'rm -rf -- "$keys"' EXIT
 trap 'exit 143' INT TERM

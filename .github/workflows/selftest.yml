@@ -270,7 +270,9 @@ jobs:
           set -euo pipefail
           [ "$FIRST" = "$SECOND" ]
           [ -d "$SECOND/Products/Applications/SelftestMac.app" ]
-          [ -z "$(ls -A "$LOGS")" ]
+          # Only the first call's archive log: the reuse ran no xcodebuild
+          # and kept that log.
+          [ "$(ls -A "$LOGS")" = archive.log ]
 
   rust:
     permissions:
