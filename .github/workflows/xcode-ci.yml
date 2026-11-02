@@ -165,14 +165,15 @@ jobs:
         env:
           HASH: ${{ hashFiles(inputs.spm-cache-key-file) }}
           PATTERN: ${{ inputs.spm-cache-key-file }}
-          XCODE_APP: ${{ inputs.xcode-app }}
         run: |
           set -euo pipefail
           if [ -z "$HASH" ]; then
             echo "::warning::spm-cache-key-file $PATTERN matched no file; the SwiftPM cache is off"
             exit 0
           fi
-          xcode=$(basename "${XCODE_APP:-default}" .app)
+          # The Xcode build version, e.g. 17A400: a new Xcode starts a new entry.
+          xcode=$(xcodebuild -version | sed -n 's/^Build version //p')
+          [ -n "$xcode" ] || { echo "::error::cannot read the Xcode build version"; exit 1; }
           echo "prefix=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-" >> "$GITHUB_OUTPUT"
           echo "key=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-$HASH" >> "$GITHUB_OUTPUT"
 
