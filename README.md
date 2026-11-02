@@ -8,10 +8,11 @@ Call one by reference:
 uses: noahkiss/workflows/.github/workflows/<name>.yml@main
 ```
 
-Every workflow runs on `ubuntu-latest`, with two exceptions: `rust-ci` takes a
-`runner` input, and `ghcr-build-push` with `native_runners` builds arm64 on
-`ubuntu-24.04-arm`. The macOS composite actions (`tauri-macos-build`,
-`macos-sign-notarize`, `release-attach`) need a macOS runner. macOS minutes are
+Every workflow runs on `ubuntu-latest`, with three exceptions: `rust-ci` and
+`go-ci` take a `runner` input, `ghcr-build-push` with `native_runners` builds
+arm64 on `ubuntu-24.04-arm`, and `xcode-ci` runs on macOS. The macOS composite
+actions (`tauri-macos-build`, `macos-sign-notarize`, `release-attach`,
+`xcode-match-signing`, `xcode-archive-upload`) need a macOS runner. macOS minutes are
 free for public repositories and metered at 10x for private ones.
 
 Composite actions live under `actions/`. Call one from a step:
@@ -65,7 +66,7 @@ A called workflow's jobs run inside the *caller's* workflow run, so there is no
 separate run for a workflow-level `concurrency:` block here to scope to. GitHub's
 own reusable-workflow reference discusses the guard only in its
 `jobs.<job_id>.concurrency` form. So `ghcr-build-push`, `node-ci`, `python-ci`, `go-ci`,
-`cf-pages-deploy` and `upstream-sync` each carry a job-level guard.
+`xcode-ci`, `cf-pages-deploy` and `upstream-sync` each carry a job-level guard.
 
 Each group name starts with a literal unique to its file. That is deliberate.
 The docs warn:
@@ -700,6 +701,290 @@ arguments. Tests for a wasm target need a runtime, so turn them off:
       build-args: --release --locked
       test: false
 ```
+
+## `xcode-ci.yml`
+
+The shared Apple build, build-only: no signing, no secrets. It selects an
+Xcode by path, runs `swift test` in each package folder, runs an optional
+generate command (XcodeGen, say), then one `xcodebuild build` per line of
+`builds` and one `xcodebuild test` per line of `tests`. It runs on macOS,
+which a public repository runs free and a private one pays 10x for.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `runner` | no | `macos-26` | macOS runner label, e.g. `xcode-27` for an Xcode the GA image lacks |
+| `xcode-app` | no | `''` → the image default | Xcode by path, e.g. `/Applications/Xcode_27.1.app`. The job fails, listing the installed ones, when it is missing. Set through `DEVELOPER_DIR`, no `sudo` |
+| `working-directory` | no | `.` | Folder the paths and commands below are relative to |
+| `swift-test-dirs` | no | `''` | Swift package folders to run `swift test` in, one per line, in order. Runs first |
+| `generate` | no | `''` | Command that makes the project, e.g. `xcodegen generate` or `scripts/generate.sh` |
+| `project` | no | `''` | `.xcodeproj` or `.xcworkspace` for project lines; empty lets xcodebuild find it |
+| `builds` | no | `''` | One build per line: `scheme \| destination`, or `scheme \| destination \| package folder` to build a Swift package's scheme in that folder |
+| `tests` | no | `''` | One `xcodebuild test` per line, the same form. The destination `ios-simulator` picks the first iPhone, by name, of the newest iOS runtime no newer than the selected Xcode's simulator SDK |
+| `xcodebuild-args` | no | `''` | Extra arguments for every xcodebuild, one per line, e.g. `CODE_SIGNING_ALLOWED=NO` |
+| `spm-cache-key-file` | no | `''` → no cache | Glob of the `Package.resolved` file(s) the SwiftPM cache keys on, from the repository root |
+| `netrc` | no | `true` | Write a `~/.netrc` for `api.github.com` with the job token. Callers with SwiftPM binary targets from GitHub saw 403s from the anonymous rate limit without it. Removed at the end |
+| `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
+| `timeout-minutes` | no | `60` | Job timeout |
+| `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
+
+Secrets: none.
+
+The log shows each xcodebuild's errors, signing warnings, failed test cases and
+verdict; the full log goes to the artifact when the job fails. The SwiftPM
+cache holds `~/Library/Caches/org.swift.swiftpm` (for `swift test`) and the
+cloned packages folder every xcodebuild uses (`-clonedSourcePackagesDirPath`).
+Its key carries the runner OS and arch, the Xcode build version and the hash of
+`spm-cache-key-file`; a miss restores the newest entry with the same prefix.
+It saves when the key missed and the builds and tests ran, also when one
+failed; with no `builds` or `tests`, only when the job succeeded. It never
+saves after an earlier step failed (the packages folder may be empty, and an
+exact-key entry is not saved again), and never from a tag.
+The job's concurrency group is
+`xcode-ci-<repo>-<calling workflow>-<working-directory>-<ref>`.
+
+Permissions the calling job must grant:
+
+```yaml
+permissions:
+  contents: read
+```
+
+```yaml
+on:
+  pull_request:
+    paths: ['apple/**', '.github/workflows/apple.yml']
+  push:
+    branches: [main]
+    paths: ['apple/**', '.github/workflows/apple.yml']
+
+jobs:
+  apple:
+    uses: noahkiss/workflows/.github/workflows/xcode-ci.yml@main
+    permissions:
+      contents: read
+    with:
+      runner: xcode-27
+      xcode-app: /Applications/Xcode_27.1.app
+      working-directory: apple
+      swift-test-dirs: Kit
+      generate: scripts/generate.sh
+      project: App.xcodeproj
+      builds: |
+        AppiOS | generic/platform=iOS Simulator
+        AppMac | generic/platform=macOS
+      tests: |
+        Kit | ios-simulator | Kit
+      spm-cache-key-file: apple/Kit/Package.resolved
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      timeout-minutes: 60
+```
+
+---
+
+## Xcode release: `actions/xcode-match-signing` + `actions/xcode-archive-upload`
+
+Signed iOS and Mac builds, as steps of **one job in the caller** that names
+the `release` environment. Not a reusable workflow, for the reason the Tauri
+release gives: environment secrets do not reach a workflow called from another
+repository.
+
+1. `actions/xcode-match-signing` reads certificates and profiles from a
+   fastlane match store, read-only, into a throwaway keychain, and writes a
+   manual-signing xcconfig.
+2. `actions/xcode-archive-upload` archives with that xcconfig, exports with
+   manual signing, and uploads to App Store Connect or notarizes a Developer ID
+   app.
+3. `actions/xcode-match-signing` again with `cleanup: 'true'` in an
+   `if: always()` step. A composite action has no post step.
+
+Nothing in CI can create a certificate, a profile or an App ID: every match
+call passes `--readonly`.
+
+### `actions/xcode-match-signing`
+
+Creates a keychain with a random, masked password, unlocked for six hours.
+Writes the deploy key to a `0600` file, clones the store over SSH with
+`StrictHostKeyChecking=yes` against `known-hosts`, and deletes the key after
+the last match call. Runs, per line of `profiles`:
+
+```
+fastlane match <type> --readonly --platform <platform> --app_identifier <ids>
+  --team_id <team-id> --git_url <match-git-url> --git_branch <git-branch>
+  --skip_docs --keychain_name <keychain> --keychain_password <random>
+```
+
+Then checks each profile it expects by match's name, `match <Kind> <bundle id>`
+with ` <platform>` after it off iOS (`AppStore`, `AdHoc`, `Development`,
+`Direct`, `InHouse`), and writes the xcconfig:
+
+```
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM = <team-id>
+CODE_SIGN_IDENTITY = <identity>
+OTHER_CODE_SIGN_FLAGS = --keychain <keychain>   (plus --timestamp for Developer ID)
+XCODE_CI_PROFILE_<bundle id as a C identifier> = <profile name>   (one per bundle id)
+PROVISIONING_PROFILE_SPECIFIER = $(XCODE_CI_PROFILE_$(PRODUCT_BUNDLE_IDENTIFIER:c99extidentifier))
+```
+
+A `-xcconfig` file outranks the project's own settings, so each target gets
+its own profile by its bundle id, and a target with none (a framework) gets
+none.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `team-id` | yes | — | Apple team id |
+| `profiles` | yes | — | One match call per line: `<type> <platform> <id>[,<id>...]`, with `certificates-only` as a fourth word to skip profiles (`--skip_provisioning_profiles`) |
+| `match-git-url` | yes | — | SSH URL of the store. **Pass it from a secret**: a variable prints unmasked in a public run log, and it names a private repository |
+| `match-password` | yes | — | The store's passphrase |
+| `match-deploy-key` | yes | — | Private SSH key with read access to the store |
+| `git-branch` | no | `main` | The store's branch. match defaults to `master`, finds an empty store and tries to create a certificate |
+| `identity` | no | from the type | `Apple Distribution`, `Apple Development` or `Developer ID Application` |
+| `xcconfig-extra` | no | `''` | Lines appended to the xcconfig |
+| `fastlane` | no | `fastlane` | The command, e.g. `bundle exec fastlane` after `ruby/setup-ruby` |
+| `known-hosts` | no | GitHub's ed25519 key | `known_hosts` line(s) for the store's host |
+| `cleanup` | no | `false` | `true` deletes the keychain, the key folder and the xcconfig, and does nothing else |
+
+| Output | Meaning |
+|---|---|
+| `keychain` | Path of the keychain |
+| `xcconfig` | Path of the xcconfig, for `xcconfig` below |
+| `identity` | The identity it uses |
+| `profiles` | JSON object from bundle id to profile name, for `provisioning-profiles` below |
+
+### `actions/xcode-archive-upload`
+
+Archives `scheme` with the xcconfig, `MARKETING_VERSION` and
+`CURRENT_PROJECT_VERSION`, exports with an `ExportOptions.plist` it writes
+(`signingStyle` manual, the certificate, `teamID`, the `provisioningProfiles`
+map), then:
+
+- `app-store-connect` with `upload: 'true'`: export with `destination`
+  `upload`, authenticated with the API key, so the build goes to App Store
+  Connect and on to TestFlight. `upload: 'false'` exports the `.ipa` to disk.
+- `developer-id`: check the signature (`codesign --verify --deep --strict`);
+  with `notarize: 'true'`, `notarytool submit` and `wait` (the notary log on
+  any verdict but `Accepted`), staple, validate, and require
+  `source=Notarized Developer ID` from `spctl`.
+- `export-method: ''`: archive only.
+
+`archive-path` takes the `archive-path` output of an earlier call and exports
+that archive without building again. So a job can archive with
+`export-method: ''`, check the archive in its own step, then export and upload
+in a second call. Calls in one job share `log-dir`: a later call keeps the
+earlier calls' logs.
+
+| Input | Required | Default | Meaning |
+|---|---|---|---|
+| `scheme` | to archive | `''` | Scheme to archive |
+| `archive-path` | no | `''` | An existing `.xcarchive` to export instead of archiving |
+| `project` | no | `''` | `.xcodeproj` or `.xcworkspace` |
+| `working-directory` | no | `.` | Folder to run in |
+| `configuration` | no | `Release` | Build configuration |
+| `destination` | no | `generic/platform=iOS` | Archive destination |
+| `xcconfig` | no | `''` | Signing xcconfig, e.g. from `xcode-match-signing` |
+| `marketing-version` | no | `''` | `MARKETING_VERSION`; empty keeps the project's |
+| `build-number` | no | `''` | `CURRENT_PROJECT_VERSION`; App Store Connect needs it to grow |
+| `xcodebuild-args` | no | `''` | Extra archive arguments, one per line, e.g. `ARCHS=arm64` |
+| `packages-dir` | no | `''` | `-clonedSourcePackagesDirPath`, for a SwiftPM cache |
+| `export-method` | no | `app-store-connect` | `app-store-connect`, `release-testing`, `enterprise`, `debugging`, `developer-id`, or `''` to archive only |
+| `team-id` | to export | `''` | Apple team id |
+| `signing-certificate` | no | from the method | Export certificate |
+| `provisioning-profiles` | no | `{}` | JSON object from bundle id to profile name |
+| `upload` | no | `true` | `app-store-connect`: upload, or export to disk |
+| `notarize` | no | `true` | `developer-id`: notarize and staple |
+| `api-key-p8` | to upload or notarize | `''` | App Store Connect API key, `.p8` PEM text |
+| `api-key-id` | to upload or notarize | `''` | Its key id |
+| `api-key-issuer-id` | to upload or notarize | `''` | Its issuer id |
+
+| Output | Meaning |
+|---|---|
+| `archive-path` | The `.xcarchive` |
+| `export-path` | The export folder |
+| `app-path` | `developer-id`: the exported `.app` |
+| `log-dir` | Full xcodebuild logs, for `actions/upload-artifact` |
+
+The key file lives under `$RUNNER_TEMP` with mode `0600` and is deleted when
+the step ends. No secret is printed. Use a Developer-role API key: it can
+upload and notarize, and cannot change the portal. App-specific checks (the
+export-compliance key in `Info.plist`, the embedded profiles) are the
+caller's own steps between the archive and the upload, or after it.
+
+### Caller
+
+```yaml
+on:
+  push:
+    tags: ['app-v*']
+
+permissions: {}
+
+jobs:
+  ios:
+    runs-on: xcode-27
+    environment: release
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    concurrency:
+      group: app-release-ios-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Select Xcode
+        run: |
+          test -d /Applications/Xcode_27.1.app
+          echo "DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer" >> "$GITHUB_ENV"
+      - id: signing
+        uses: noahkiss/workflows/actions/xcode-match-signing@main
+        with:
+          team-id: ${{ vars.APPLE_TEAM_ID }}
+          profiles: appstore ios com.example.app,com.example.app.widgets
+          match-git-url: ${{ secrets.MATCH_GIT_URL }}
+          match-password: ${{ secrets.MATCH_PASSWORD }}
+          match-deploy-key: ${{ secrets.MATCH_DEPLOY_KEY }}
+      - run: scripts/generate.sh
+      - id: archive
+        uses: noahkiss/workflows/actions/xcode-archive-upload@main
+        with:
+          project: App.xcodeproj
+          scheme: AppiOS
+          xcconfig: ${{ steps.signing.outputs.xcconfig }}
+          marketing-version: '1.2.0'
+          build-number: ${{ github.run_number }}
+          export-method: ''
+      - name: Check export compliance
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive-path }}
+        run: |
+          test "$(plutil -extract ITSAppUsesNonExemptEncryption raw -o - \
+            "$ARCHIVE/Products/Applications/AppiOS.app/Info.plist")" = false
+      - id: upload
+        uses: noahkiss/workflows/actions/xcode-archive-upload@main
+        with:
+          archive-path: ${{ steps.archive.outputs.archive-path }}
+          team-id: ${{ vars.APPLE_TEAM_ID }}
+          provisioning-profiles: ${{ steps.signing.outputs.profiles }}
+          api-key-p8: ${{ secrets.UPLOAD_KEY_P8 }}
+          api-key-id: ${{ secrets.UPLOAD_KEY_ID }}
+          api-key-issuer-id: ${{ secrets.ASC_ISSUER_ID }}
+      - if: always()
+        uses: noahkiss/workflows/actions/xcode-match-signing@main
+        with:
+          cleanup: 'true'
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-logs
+          path: ${{ steps.upload.outputs.log-dir || steps.archive.outputs.log-dir }}
+          if-no-files-found: ignore
+```
+
+A Mac job is the same with `profiles: developer_id macos com.example.mac
+certificates-only` (no profile needed when the app has no entitlement that
+asks for one), `destination: generic/platform=macOS`, `xcodebuild-args:
+ARCHS=arm64` and `export-method: developer-id`. Mac App Store export is not
+supported yet: match installs no Mac Installer Distribution certificate, and
+the export writes no installer signing certificate.
 
 ---
 

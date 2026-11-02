@@ -1,0 +1,5 @@
+// What xcode-match-signing writes, with made-up profile names: the selftest
+// checks each target resolves its own profile through the lookup line.
+XCODE_CI_PROFILE_com_example_selftest_ios = match AppStore com.example.selftest.ios
+XCODE_CI_PROFILE_com_example_selftest_mac = match Direct com.example.selftest.mac macos
+PROVISIONING_PROFILE_SPECIFIER = $(XCODE_CI_PROFILE_$(PRODUCT_BUNDLE_IDENTIFIER:c99extidentifier))

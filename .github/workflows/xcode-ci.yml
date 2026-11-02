@@ -1,0 +1,336 @@
+name: Xcode CI
+
+# Build-only Apple CI: no signing, no secrets. Selects an Xcode by path, runs
+# `swift test` in the given package folders, runs an optional generate command
+# (XcodeGen, say), then `xcodebuild build` and `xcodebuild test` per line of
+# `builds` and `tests`. SwiftPM checkouts and binary artifacts are cached,
+# keyed on a Package.resolved. Signed archives and uploads are not here: they
+# need environment secrets, which do not reach a reusable workflow from another
+# repo, so they are the composite actions xcode-match-signing and
+# xcode-archive-upload, run as steps of the caller's own job.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: macOS runner label, e.g. macos-26 or xcode-27.
+        required: false
+        type: string
+        default: macos-26
+      xcode-app:
+        description: >-
+          Xcode to use, by path, e.g. /Applications/Xcode_27.1.app. The job
+          fails when it is missing. Empty uses the image's default Xcode.
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: Folder the other paths and commands are relative to.
+        required: false
+        type: string
+        default: .
+      generate:
+        description: >-
+          Command that makes the project, e.g. `xcodegen generate` or a script.
+          Runs after the swift-test-dirs and before the builds. Empty for none.
+        required: false
+        type: string
+        default: ''
+      project:
+        description: >-
+          The .xcodeproj or .xcworkspace for builds and tests without a package
+          folder. Empty lets xcodebuild find the one in working-directory.
+        required: false
+        type: string
+        default: ''
+      swift-test-dirs:
+        description: Swift package folders to run `swift test` in, one per line, in order.
+        required: false
+        type: string
+        default: ''
+      builds:
+        description: >-
+          One build per line: `scheme | destination`, or
+          `scheme | destination | package folder` to build a Swift package's
+          scheme in that folder instead of the project. Example:
+          `App | generic/platform=iOS Simulator`.
+        required: false
+        type: string
+        default: ''
+      tests:
+        description: >-
+          One `xcodebuild test` per line, the same form as builds. The
+          destination `ios-simulator` means an available iPhone simulator of
+          the newest iOS runtime the selected Xcode's SDK supports.
+        required: false
+        type: string
+        default: ''
+      xcodebuild-args:
+        description: >-
+          Extra arguments for every xcodebuild, one per line, e.g.
+          `CODE_SIGNING_ALLOWED=NO` or `-skipMacroValidation`.
+        required: false
+        type: string
+        default: ''
+      spm-cache-key-file:
+        description: >-
+          Glob of the Package.resolved file(s) the SwiftPM cache is keyed on,
+          relative to the repository root. Empty turns the cache off.
+        required: false
+        type: string
+        default: ''
+      netrc:
+        description: >-
+          Write a ~/.netrc for api.github.com with the job token. Callers with
+          SwiftPM binary targets from GitHub saw 403s from the anonymous rate
+          limit without it. Removed when the job ends.
+        required: false
+        type: boolean
+        default: true
+      logs-name:
+        description: >-
+          Artifact name for the full logs, uploaded when the job fails. Give
+          each call a different name when one run calls this workflow twice.
+        required: false
+        type: string
+        default: xcode-ci-logs
+      timeout-minutes:
+        description: Job timeout in minutes.
+        required: false
+        type: number
+        default: 60
+      cancel-in-progress:
+        description: >-
+          Cancel this job when a newer run of the same workflow reaches the
+          same group. Pass `github.ref != 'refs/heads/main'` to keep main runs.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  ci:
+    name: Xcode CI
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    concurrency:
+      group: xcode-ci-${{ github.repository }}-${{ github.workflow }}-${{ inputs.working-directory }}-${{ github.ref }}
+      cancel-in-progress: ${{ inputs.cancel-in-progress }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # DEVELOPER_DIR picks the Xcode for every later step without sudo or
+      # xcode-select, so the runner's global choice is never changed.
+      - name: Select Xcode
+        env:
+          XCODE_APP: ${{ inputs.xcode-app }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_OS" = macOS ] || { echo "::error::xcode-ci needs a macOS runner"; exit 1; }
+          if [ -n "$XCODE_APP" ]; then
+            if [ ! -d "$XCODE_APP/Contents/Developer" ]; then
+              installed=$(find /Applications -maxdepth 1 -name 'Xcode*.app' -print | sort | tr '\n' ' ')
+              echo "::error title=Xcode missing::$XCODE_APP is not on this runner. Installed: $installed"
+              exit 1
+            fi
+            echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+            export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+          fi
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          {
+            echo "XCODE_CI_LOGS=$RUNNER_TEMP/xcode-ci-logs"
+            echo "XCODE_CI_PACKAGES=$RUNNER_TEMP/xcode-ci-packages"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/xcode-ci-logs" "$RUNNER_TEMP/xcode-ci-packages"
+
+      - name: Write ~/.netrc for SwiftPM
+        if: inputs.netrc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ( umask 077; printf 'machine api.github.com\n  login x-access-token\n  password %s\n' "$GH_TOKEN" > ~/.netrc )
+
+      - name: SwiftPM cache key
+        id: spm-key
+        if: inputs.spm-cache-key-file != ''
+        env:
+          HASH: ${{ hashFiles(inputs.spm-cache-key-file) }}
+          PATTERN: ${{ inputs.spm-cache-key-file }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HASH" ]; then
+            echo "::warning::spm-cache-key-file $PATTERN matched no file; the SwiftPM cache is off"
+            exit 0
+          fi
+          # The Xcode build version, e.g. 17A400: a new Xcode starts a new entry.
+          xcode=$(xcodebuild -version | sed -n 's/^Build version //p')
+          [ -n "$xcode" ] || { echo "::error::cannot read the Xcode build version"; exit 1; }
+          echo "prefix=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-" >> "$GITHUB_OUTPUT"
+          echo "key=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-$HASH" >> "$GITHUB_OUTPUT"
+
+      # The shared SwiftPM cache serves `swift test`; the cloned packages
+      # folder serves xcodebuild (-clonedSourcePackagesDirPath).
+      - name: Restore the SwiftPM cache
+        id: spm-cache
+        if: steps.spm-key.outputs.key != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ${{ runner.temp }}/xcode-ci-packages
+          key: ${{ steps.spm-key.outputs.key }}
+          restore-keys: ${{ steps.spm-key.outputs.prefix }}
+
+      - name: Swift package tests
+        if: inputs.swift-test-dirs != ''
+        env:
+          DIRS: ${{ inputs.swift-test-dirs }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            dir="${dir%$'\r'}"
+            dir="${dir#"${dir%%[![:space:]]*}"}"
+            dir="${dir%"${dir##*[![:space:]]}"}"
+            [ -n "$dir" ] || continue
+            echo "::group::swift test in $dir"
+            ( cd "$dir" && swift test ) </dev/null
+            echo "::endgroup::"
+          done <<< "$DIRS"
+
+      - name: Generate the project
+        if: inputs.generate != ''
+        env:
+          GENERATE: ${{ inputs.generate }}
+        run: |
+          set -euo pipefail
+          eval "$GENERATE" </dev/null
+
+      - name: Builds and tests
+        id: builds
+        if: inputs.builds != '' || inputs.tests != ''
+        env:
+          BUILDS: ${{ inputs.builds }}
+          TESTS: ${{ inputs.tests }}
+          PROJECT: ${{ inputs.project }}
+          EXTRA_ARGS: ${{ inputs.xcodebuild-args }}
+        run: |
+          set -euo pipefail
+          trim() { local s="$1"; s="${s%$'\r'}"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+          extra=()
+          while IFS= read -r arg; do
+            arg=$(trim "$arg")
+            [ -n "$arg" ] && extra+=("$arg")
+          done <<< "$EXTRA_ARGS"
+
+          project=()
+          case "$PROJECT" in
+            '') ;;
+            *.xcworkspace) project=(-workspace "$PROJECT") ;;
+            *) project=(-project "$PROJECT") ;;
+          esac
+
+          # The first iPhone by name of the newest iOS runtime no newer than
+          # the selected Xcode's simulator SDK, as id=<udid>. Runtimes are
+          # system-wide, so a newer Xcode on the image can leave a runtime
+          # this Xcode cannot test on.
+          ios_simulator() {
+            local sdk
+            sdk=$(xcrun --sdk iphonesimulator --show-sdk-version) || return 1
+            xcrun simctl list devices available --json | SDK="$sdk" python3 -I -c '
+          import json, os, re, sys
+          devices = json.load(sys.stdin)["devices"]
+          sdk = [int(n) for n in re.findall(r"\d+", os.environ["SDK"])]
+          def version(runtime):
+              return [int(n) for n in re.findall(r"\d+", runtime.rsplit(".", 1)[-1])]
+          runtimes = [r for r in devices if ".iOS-" in r and version(r) <= sdk]
+          for runtime in sorted(runtimes, key=version, reverse=True):
+              for device in sorted(devices[runtime], key=lambda d: (d["name"], d["udid"])):
+                  if device["name"].startswith("iPhone"):
+                      print("id=" + device["udid"])
+                      sys.exit(0)
+          sys.exit("no available iPhone simulator for the iOS " + os.environ["SDK"] + " SDK on this runner")
+          '
+          }
+
+          n=0
+          run() { # action, line
+            local action="$1" line="$2" scheme destination dir log status
+            IFS='|' read -r scheme destination dir <<< "$line"
+            scheme=$(trim "$scheme"); destination=$(trim "$destination"); dir=$(trim "${dir:-}")
+            [ -n "$scheme" ] || return 0
+            if [ -z "$destination" ]; then
+              echo "::error::'$line' has no destination; write scheme | destination"
+              return 1
+            fi
+            if [ "$destination" = ios-simulator ]; then
+              destination=$(ios_simulator)
+            fi
+            n=$((n + 1))
+            log="$XCODE_CI_LOGS/$n-$action-${scheme//[^A-Za-z0-9._-]/_}.log"
+            local where=()
+            if [ -z "$dir" ] && [ "${#project[@]}" -gt 0 ]; then
+              where=("${project[@]}")
+            fi
+            echo "::group::xcodebuild $action $scheme ($destination)${dir:+ in $dir}"
+            set +e
+            ( [ -z "$dir" ] || cd "$dir" || exit 1
+              xcodebuild ${where[@]+"${where[@]}"} -scheme "$scheme" -destination "$destination" \
+                -clonedSourcePackagesDirPath "$XCODE_CI_PACKAGES" \
+                ${extra[@]+"${extra[@]}"} "$action" ) </dev/null 2>&1 \
+              | tee "$log" \
+              | grep -E --line-buffered '(error:|warning: .*(sign|profile|entitlement)|Test Case .* failed|Executed [0-9]+ tests?|\*\* [A-Z ]+ (SUCCEEDED|FAILED) \*\*)'
+            status=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::xcodebuild $action $scheme failed (exit $status); last lines of $log:"
+              tail -n 40 "$log"
+              return "$status"
+            fi
+          }
+
+          while IFS= read -r line; do run build "$line"; done <<< "$BUILDS"
+          while IFS= read -r line; do run test "$line"; done <<< "$TESTS"
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.logs-name }}
+          path: ${{ runner.temp }}/xcode-ci-logs
+          if-no-files-found: ignore
+
+      # Saved when the builds and tests ran, even when one failed, so the
+      # checkouts are not lost to a failing test; with no builds or tests, only
+      # on success. Not after an earlier failure: the packages folder may be
+      # empty, and an exact-key entry is never saved again. Never from a tag:
+      # a tag's cache is visible to that tag only.
+      - name: Save the SwiftPM cache
+        if: >-
+          !cancelled() && steps.spm-key.outputs.key != ''
+          && steps.spm-cache.outputs.cache-hit != 'true'
+          && !startsWith(github.ref, 'refs/tags/')
+          && (steps.builds.outcome == 'success' || steps.builds.outcome == 'failure'
+          || (inputs.builds == '' && inputs.tests == '' && success()))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ${{ runner.temp }}/xcode-ci-packages
+          key: ${{ steps.spm-key.outputs.key }}
+
+      - name: Remove ~/.netrc
+        if: always() && inputs.netrc
+        run: rm -f ~/.netrc
