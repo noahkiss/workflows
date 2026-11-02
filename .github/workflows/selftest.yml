@@ -104,6 +104,154 @@ jobs:
         mkdir -p .selftest-cache && echo built > .selftest-cache/out
         go test ./...
 
+  # Every xcode-ci input on the fixture app: swift test, XcodeGen, an iOS
+  # Simulator and a macOS build, the package's tests on a simulator, the cache.
+  xcode:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/xcode-ci.yml
+    with:
+      runner: macos-26
+      xcode-app: /Applications/Xcode.app
+      working-directory: selftest/xcode
+      swift-test-dirs: Kit
+      generate: ./generate.sh
+      project: Selftest.xcodeproj
+      builds: |
+        SelftestiOS | generic/platform=iOS Simulator
+        SelftestMac | generic/platform=macOS
+      tests: |
+        Kit | ios-simulator | Kit
+      spm-cache-key-file: selftest/xcode/Kit/Package.swift
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      timeout-minutes: 30
+
+  # The release actions without Apple credentials: fastlane is a stand-in,
+  # so the run checks the match flags, the keychain, the xcconfig, the
+  # profile check, cleanup and an unsigned archive.
+  xcode-actions:
+    runs-on: macos-26
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SELFTEST_MATCH_PASSPHRASE: selftest-secret
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Signing with no secrets is refused
+        id: nosecrets
+        continue-on-error: true
+        uses: ./actions/xcode-match-signing
+        with:
+          team-id: ABCDE12345
+          profiles: developer_id macos com.example.selftest.mac certificates-only
+
+      - name: Certificates only, through the stand-in fastlane
+        id: certs
+        uses: ./actions/xcode-match-signing
+        with:
+          team-id: ABCDE12345
+          profiles: developer_id macos com.example.selftest.mac certificates-only
+          match-git-url: git@example.invalid:store.git
+          match-password: ${{ env.SELFTEST_MATCH_PASSPHRASE }}
+          match-deploy-key: selftest-key
+          fastlane: ${{ github.workspace }}/selftest/xcode/fake-fastlane.sh
+          xcconfig-extra: SELFTEST_EXTRA = yes
+
+      - name: Check the match call, the keychain and the xcconfig
+        env:
+          OUTCOME: ${{ steps.nosecrets.outcome }}
+          KEYCHAIN: ${{ steps.certs.outputs.keychain }}
+          XCCONFIG: ${{ steps.certs.outputs.xcconfig }}
+          IDENTITY: ${{ steps.certs.outputs.identity }}
+          PROFILES: ${{ steps.certs.outputs.profiles }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = failure ]
+          args=$(cat "$RUNNER_TEMP/fake-fastlane-args")
+          echo "$args"
+          for flag in 'match developer_id --readonly' '--platform macos' '--git_branch main' \
+                      '--skip_docs' '--team_id ABCDE12345' '--skip_provisioning_profiles' \
+                      '--app_identifier com.example.selftest.mac'; do
+            grep -qF -- "$flag" <<< "$args"
+          done
+          [ ! -e "$(cat "$RUNNER_TEMP/fake-fastlane-key")" ]
+          security show-keychain-info "$KEYCHAIN"
+          [ "$IDENTITY" = "Developer ID Application" ]
+          [ "$PROFILES" = '{}' ]
+          cat "$XCCONFIG"
+          grep -qx 'CODE_SIGN_STYLE = Manual' "$XCCONFIG"
+          grep -qx 'DEVELOPMENT_TEAM = ABCDE12345' "$XCCONFIG"
+          grep -qx "OTHER_CODE_SIGN_FLAGS = --keychain $KEYCHAIN --timestamp" "$XCCONFIG"
+          grep -qx 'SELFTEST_EXTRA = yes' "$XCCONFIG"
+
+      - name: A profile match did not install is refused
+        id: noprofile
+        continue-on-error: true
+        uses: ./actions/xcode-match-signing
+        with:
+          team-id: ABCDE12345
+          profiles: appstore ios com.example.selftest.ios
+          match-git-url: git@example.invalid:store.git
+          match-password: ${{ env.SELFTEST_MATCH_PASSPHRASE }}
+          match-deploy-key: selftest-key
+          fastlane: ${{ github.workspace }}/selftest/xcode/fake-fastlane.sh
+
+      - name: Clean up
+        id: cleanup
+        if: always()
+        uses: ./actions/xcode-match-signing
+        with:
+          cleanup: 'true'
+
+      - name: Check the refusal and the cleanup
+        env:
+          OUTCOME: ${{ steps.noprofile.outcome }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = failure ]
+          [ ! -e "$RUNNER_TEMP/xcode-match-signing.keychain-db" ]
+          [ ! -e "$RUNNER_TEMP/xcode-match-signing.xcconfig" ]
+          [ ! -e "$RUNNER_TEMP/xcode-match-signing-keys" ]
+
+      # The lookup line xcode-match-signing writes gives each target its own profile.
+      - name: Check the profile lookup
+        working-directory: selftest/xcode
+        run: |
+          set -euo pipefail
+          ./generate.sh
+          for pair in 'SelftestiOS:match AppStore com.example.selftest.ios' \
+                      'SelftestMac:match Direct com.example.selftest.mac macos'; do
+            settings=$(xcodebuild -project Selftest.xcodeproj -target "${pair%%:*}" \
+              -xcconfig signing-check.xcconfig -showBuildSettings)
+            grep -qx "    PROVISIONING_PROFILE_SPECIFIER = ${pair#*:}" <<< "$settings"
+          done
+
+      - name: Archive only, ad hoc signed
+        id: archive
+        uses: ./actions/xcode-archive-upload
+        with:
+          working-directory: selftest/xcode
+          project: Selftest.xcodeproj
+          scheme: SelftestMac
+          destination: generic/platform=macOS
+          export-method: ''
+          marketing-version: '2.3.4'
+          build-number: '202611010000'
+
+      - name: Check the archive
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive-path }}
+        run: |
+          set -euo pipefail
+          plist="$ARCHIVE/Products/Applications/SelftestMac.app/Contents/Info.plist"
+          [ "$(plutil -extract CFBundleShortVersionString raw -o - "$plist")" = 2.3.4 ]
+          [ "$(plutil -extract CFBundleVersion raw -o - "$plist")" = 202611010000 ]
+
   rust:
     permissions:
       contents: read
