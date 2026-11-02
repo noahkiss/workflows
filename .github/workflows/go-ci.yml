@@ -100,6 +100,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Before setup-go, so the Go that setup-go installs comes first on PATH even when
+      # mise.toml also lists go: go-version-file stays the one source of the Go version.
+      # mise saves its cache from the default branch only, like the extra cache below.
+      - name: Install mise tools
+        if: inputs.mise
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          working_directory: ${{ inputs.working-directory }}
+          cache_save: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch || 'main') }}
+
       # setup-go caches the module and build caches, keyed on go.sum.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -107,12 +117,6 @@ jobs:
           go-version: ${{ inputs.go-version }}
           go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
           cache-dependency-path: ${{ inputs.working-directory }}/go.sum
-
-      - name: Install mise tools
-        if: inputs.mise
-        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
-        with:
-          working_directory: ${{ inputs.working-directory }}
 
       - name: Check the cache inputs
         if: inputs.cache-path != '' || inputs.cache-key != ''
@@ -169,7 +173,9 @@ jobs:
             [ -n "$command" ] || continue
             ran=1
             echo "::group::${command}"
-            eval "${command}"
+            # stdin is the command list itself; a command that reads stdin would swallow the
+            # commands after it.
+            eval "${command}" </dev/null
             echo "::endgroup::"
           done <<< "$COMMANDS"
           if [ "$ran" = 0 ]; then
@@ -178,13 +184,15 @@ jobs:
 
       # Saved even when a command failed, so a slow build the commands made is
       # not lost to a failing test. Only the default branch saves, so other
-      # branches and tags restore its entry and never fill the cache.
+      # branches and tags restore its entry and never fill the cache. A schedule
+      # event's payload may carry no repository, so the ref is compared with
+      # refs/heads/main then.
       - name: Check the extra cache path
         id: extra-cache-path
         if: >-
           !cancelled() && inputs.cache-key != ''
           && steps.extra-cache.outputs.cache-hit != 'true'
-          && github.ref_name == github.event.repository.default_branch
+          && github.ref == format('refs/heads/{0}', github.event.repository.default_branch || 'main')
         env:
           CACHE_PATH: ${{ inputs.cache-path }}
         run: |
