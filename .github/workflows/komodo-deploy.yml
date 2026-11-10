@@ -30,6 +30,13 @@ on:
         required: false
         type: number
         default: 10
+      timeout_warn_percent:
+        description: >-
+          Warn (an annotation and a line in the job summary) when the job
+          used this percent of timeout_minutes or more. 0 turns the check off.
+        required: false
+        type: number
+        default: 75
     secrets:
       webhook_secret:
         description: Shared secret the listener verifies. Must match KOMODO_WEBHOOK_SECRET.
@@ -48,6 +55,13 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions: {}
     steps:
+      # First, so the check at the end counts nearly all of the job.
+      - name: Record the start time
+        id: timeout-start
+        shell: bash
+        working-directory: .
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       # The signing logic lives in the composite action, which
       # ghcr-build-push also runs, so the two cannot drift. A reusable
       # workflow resolves a ./ path against the caller's checkout, so the
@@ -59,3 +73,33 @@ jobs:
           listener-url: ${{ secrets.komodo_listener_url || inputs.listener_url }}
           ref: ${{ inputs.ref }}
           webhook-secret: ${{ secrets.webhook_secret }}
+
+      # Last, and it runs whatever happened before it, so a slow failing job
+      # warns too. It never fails the job.
+      - name: Check the time against the timeout
+        if: always() && inputs.timeout_warn_percent > 0
+        shell: bash
+        working-directory: .
+        env:
+          START: ${{ steps.timeout-start.outputs.epoch }}
+          LIMIT: ${{ inputs.timeout_minutes }}
+          WARN: ${{ inputs.timeout_warn_percent }}
+          LABEL: komodo-deploy
+          INPUT: timeout_minutes
+          STATUS: ${{ job.status }}
+        run: |
+          for v in "$START" "$LIMIT" "$WARN"; do
+            case "$v" in
+              '' | *[!0-9]*) echo "Timeout check skipped: start, $INPUT or the percent is not a whole number."; exit 0 ;;
+            esac
+          done
+          [ "$LIMIT" -gt 0 ] || exit 0
+          secs=$(( $(date +%s) - START ))
+          pct=$(( secs * 100 / (LIMIT * 60) ))
+          mins=$(( (secs + 30) / 60 ))
+          echo "$LABEL used $mins of $LIMIT minutes ($pct%); job status $STATUS."
+          if [ "$pct" -ge "$WARN" ]; then
+            msg="$LABEL used $mins of $LIMIT minutes ($pct%). Raise $INPUT or split the job."
+            echo "::warning title=Near the job timeout::$msg"
+            echo "**Near the job timeout:** $msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
