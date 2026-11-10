@@ -117,6 +117,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 ```
 
+- **Every workflow runs only for the paths it tests.** The block above fits a
+  repository with one stack. A repository with several stacks (an Apple app, a
+  Go server, a web `frontend/`) has one workflow per stack, each with a `paths`
+  allow-list of its own sources, lockfiles, build scripts and the shared inputs
+  it reads. Each lists its own workflow file. A workflow with skippable paths
+  cannot be a required check; require one always-on gate job instead.
 - **One full run per change.** Run the full suite on the pull request. Then a
   push to main after the merge needs only a fast check; a direct push to main
   with no pull request runs the full suite.
