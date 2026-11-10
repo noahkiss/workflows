@@ -87,6 +87,19 @@ jobs:
     with:
       working-directory: selftest/go
 
+  # Two calls in one run on the same runner and ref, as a matrix of shards: with
+  # concurrency-key they share no group, so neither is cancelled and both finish.
+  go-shards:
+    strategy:
+      matrix:
+        shard: [a, b]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/go-ci.yml
+    with:
+      working-directory: selftest/go
+      concurrency-key: ${{ matrix.shard }}
+
   # Every newer input at once, on macOS. Its runner differs from the job above,
   # so the two share no concurrency group and both finish. timeout-warn-percent 1
   # makes the timeout check warn on every run, so its warning path runs here.

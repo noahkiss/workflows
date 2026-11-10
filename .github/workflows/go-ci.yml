@@ -87,6 +87,14 @@ on:
         required: false
         type: boolean
         default: true
+      concurrency-key:
+        description: >-
+          Extra text for the job's concurrency group, so several calls of
+          go-ci in one run (a matrix of test shards, say) do not cancel or
+          queue behind each other. Pass the matrix value, e.g. the shard.
+        required: false
+        type: string
+        default: ''
 
 jobs:
   ci:
@@ -98,7 +106,7 @@ jobs:
     # github.workflow is the caller's workflow name here, so two workflows of
     # one repo (CI on main and a nightly schedule) no longer share a group.
     concurrency:
-      group: go-ci-${{ github.repository }}-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.runner }}-${{ github.ref }}
+      group: go-ci-${{ github.repository }}-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.runner }}-${{ github.ref }}${{ inputs.concurrency-key != '' && format('-{0}', inputs.concurrency-key) || '' }}
       cancel-in-progress: ${{ inputs.cancel-in-progress }}
     defaults:
       run:

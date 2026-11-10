@@ -632,12 +632,13 @@ The shared Go gate: Go from the module's version file, an optional `gofmt` and
 | `cache-path` | no | `''` | One extra path to cache, relative to `working-directory`, e.g. a library the commands build. Needs `cache-key` |
 | `cache-key` | no | `''` | Key for `cache-path`. Restored on every run; saved after the commands on the default branch only, when the key missed, even if a command failed |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
+| `concurrency-key` | no | `''` | Extra text for the concurrency group, so several calls in one run (a matrix of test shards) do not cancel or queue behind each other. Pass e.g. `${{ matrix.shard }}` |
 
 Secrets: none.
 
 Each command runs with stdin from `/dev/null`, so a command that reads stdin cannot swallow the
 commands after it. The job's concurrency group is
-`go-ci-<repo>-<calling workflow>-<working-directory>-<runner>-<ref>`. Two workflows of
+`go-ci-<repo>-<calling workflow>-<working-directory>-<runner>-<ref>`, then `-<concurrency-key>` when set. Two workflows of
 one repo (CI on main and a nightly schedule, say) or two runners in one run no longer
 cancel each other.
 
@@ -750,6 +751,7 @@ which a public repository runs free and a private one pays 10x for.
 | `timeout-minutes` | no | `60` | Job timeout |
 | `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
+| `concurrency-key` | no | `''` | Extra text for the concurrency group, so several calls in one run (a matrix of test shards) do not cancel or queue behind each other. Pass e.g. `${{ matrix.shard }}` |
 
 Secrets: none.
 
