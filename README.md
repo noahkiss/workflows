@@ -140,7 +140,7 @@ concurrency:
 
 ## `komodo-deploy.yml`
 
-Replaces the inline deploy step copied into four repositories. It posts a signed
+Replaces an inline deploy step in each caller. It posts a signed
 synthetic push event to a Komodo webhook listener, which then redeploys one
 stack.
 
@@ -735,7 +735,7 @@ which a public repository runs free and a private one pays 10x for.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
-| `runner` | no | `macos-26` | macOS runner label, e.g. `xcode-27` for an Xcode the GA image lacks |
+| `runner` | no | `macos-26` | macOS runner label, e.g. a larger runner of your own (`my-xcode-runner`) for an Xcode the GA image lacks |
 | `xcode-app` | no | `''` → the image default | Xcode by path, e.g. `/Applications/Xcode_27.1.app`. The job fails, listing the installed ones, when it is missing. Set through `DEVELOPER_DIR`, no `sudo` |
 | `working-directory` | no | `.` | Folder the paths and commands below are relative to |
 | `swift-test-dirs` | no | `''` | Swift package folders to run `swift test` in, one per line, in order. Runs first |
@@ -787,7 +787,7 @@ jobs:
     permissions:
       contents: read
     with:
-      runner: xcode-27
+      runner: my-xcode-runner
       xcode-app: /Applications/Xcode_27.1.app
       working-directory: apple
       swift-test-dirs: Kit
@@ -944,7 +944,7 @@ permissions: {}
 
 jobs:
   ios:
-    runs-on: xcode-27
+    runs-on: my-xcode-runner
     environment: release
     timeout-minutes: 120
     permissions:

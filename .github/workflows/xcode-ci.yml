@@ -13,7 +13,7 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: macOS runner label, e.g. macos-26 or xcode-27.
+        description: macOS runner label, e.g. macos-26 or a larger runner of your own.
         required: false
         type: string
         default: macos-26
