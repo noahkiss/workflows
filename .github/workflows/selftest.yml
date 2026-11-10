@@ -52,6 +52,7 @@ jobs:
     with:
       working-directory: selftest/node-plain
       scripts: ''
+      timeout-warn-percent: 0
 
   node-playwright:
     permissions:
@@ -87,7 +88,8 @@ jobs:
       working-directory: selftest/go
 
   # Every newer input at once, on macOS. Its runner differs from the job above,
-  # so the two share no concurrency group and both finish.
+  # so the two share no concurrency group and both finish. timeout-warn-percent 1
+  # makes the timeout check warn on every run, so its warning path runs here.
   go-extras:
     permissions:
       contents: read
@@ -99,6 +101,8 @@ jobs:
       cache-path: .selftest-cache
       cache-key: go-ci-selftest-v1
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      timeout-minutes: 10
+      timeout-warn-percent: 1
       commands: |
         jq --version
         mkdir -p .selftest-cache && echo built > .selftest-cache/out
