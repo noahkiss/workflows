@@ -85,6 +85,16 @@ job. A job that hangs then stops in minutes, not after GitHub's six hours.
 `dispatch-and-wait` and `upstream-sync` bound themselves already. A composite
 action cannot set a timeout: put `timeout-minutes` on the caller's job.
 
+**Each of those jobs warns before its timeout bites.** Its first step records
+the start time; its last step runs whatever happened before it and compares
+the time used with the timeout. At 75% or more it writes a `::warning::`
+annotation and a line in the job summary, for example
+`go-ci used 38 of 45 minutes (84%). Raise timeout-minutes or split the job.`
+GitHub runs that last step even after the timeout cancelled the job (checked
+on a probe run, 2026-11-10), so a timed-out job says so in its summary too.
+`timeout-warn-percent` (`timeout_warn_percent` in the snake_case workflows)
+moves the threshold; `0` turns the check off. The check never fails a job.
+
 ## Saving CI minutes and time
 
 What a caller does so that CI spends minutes only on runs that test something.
@@ -138,6 +148,8 @@ secret is empty. The action never prints the URL either way.
 | `stack` | yes | — | Komodo stack name |
 | `listener_url` | no | `''` | Listener base URL, no trailing slash; used when the secret is empty |
 | `ref` | no | `refs/heads/main` | Git ref sent in the payload |
+| `timeout_minutes` | no | `10` | Job timeout |
+| `timeout_warn_percent` | no | `75` | Warn when the job used this percent of `timeout_minutes` or more; `0` turns it off |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -232,6 +244,7 @@ Replaces the near-identical GHCR build in ten repositories. It builds
 | `deploy_stack` | no | `''` → no deploy | Komodo stack to redeploy after the push; see below |
 | `listener_url` | with `deploy_stack`, unless the secret is set | `''` | Komodo listener base URL, no trailing slash |
 | `timeout_minutes` | no | `45` | Timeout of each build job |
+| `timeout_warn_percent` | no | `75` | Warn when each build job used this percent of `timeout_minutes` or more; `0` turns it off |
 
 Default `tags`:
 
@@ -465,6 +478,7 @@ lockfile, then runs the named package scripts in order.
 | `artifact_name` | no | `node-ci-artifact` | Artifact name; unique per run |
 | `artifact_when` | no | `failure` | `failure`, or `always` (any run not cancelled) |
 | `timeout-minutes` | no | `20` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -550,6 +564,7 @@ runs the given commands in order under `uv run`.
 | `install` | no | `uv sync --frozen` | Install command; empty skips the step |
 | `commands` | no | `pytest` | Commands run under `uv run`, one per line, in order |
 | `timeout-minutes` | no | `20` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 
 Secrets: none.
 
@@ -605,6 +620,7 @@ The shared Go gate: Go from the module's version file, an optional `gofmt` and
 | `generate-check` | no | `false` | Run `go generate ./...` and fail when it changes or adds a file |
 | `commands` | no | `go vet ./...` and `go test ./...` | Commands, one per line, in order |
 | `timeout-minutes` | no | `20` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 | `runner` | no | `ubuntu-latest` | Runner label, e.g. `ubuntu-24.04-arm` or `macos-26` |
 | `mise` | no | `false` | Install the tools in `mise.toml` (in `working-directory`) with `jdx/mise-action`, e.g. a C toolchain the commands need. It runs before setup-go, so setup-go's Go wins over a `go` entry in `mise.toml`. Its cache saves on the default branch only |
 | `cache-path` | no | `''` | One extra path to cache, relative to `working-directory`, e.g. a library the commands build. Needs `cache-key` |
@@ -664,6 +680,7 @@ clippy, an optional `cargo build` and the tests, with `Swatinem/rust-cache`.
 | `env` | no | `''` | Environment for every cargo command, one `KEY=value` per line |
 | `cache-save` | no | `default-branch` | When to save the Rust cache: `default-branch`, `always`, `never` |
 | `timeout-minutes` | no | `30` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 
 Secrets: none.
 
@@ -725,6 +742,7 @@ which a public repository runs free and a private one pays 10x for.
 | `netrc` | no | `true` | Write a `~/.netrc` for `api.github.com` with the job token. Callers with SwiftPM binary targets from GitHub saw 403s from the anonymous rate limit without it. Removed at the end |
 | `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
 | `timeout-minutes` | no | `60` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
 
 Secrets: none.
@@ -1068,6 +1086,7 @@ Replaces three inconsistent Cloudflare Pages deploys.
 | `node-version-file` | no | `.node-version` | Version file, relative to `working-directory` |
 | `wrangler-version` | no | `''` → wrangler-action's choice | Pin wrangler, e.g. `3`; see below |
 | `timeout-minutes` | no | `15` | Job timeout |
+| `timeout-warn-percent` | no | `75` | Warn when the job used this percent of `timeout-minutes` or more; `0` turns it off |
 
 | Secret | Required | Meaning |
 |---|---|---|

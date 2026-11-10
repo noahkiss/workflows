@@ -190,7 +190,9 @@ jobs:
         run: npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy "$DIRECTORY" --project-name="$PROJECT"
 
       # Last, and it runs whatever happened before it, so a slow failing job
-      # warns too. It never fails the job.
+      # warns too. GitHub also runs it after the job timeout cancels the steps
+      # (job.status is then cancelled), so a timed-out job says why. It never
+      # fails the job.
       - name: Check the time against the timeout
         if: always() && inputs.timeout-warn-percent > 0
         shell: bash
@@ -215,6 +217,9 @@ jobs:
           echo "$LABEL used $mins of $LIMIT minutes ($pct%); job status $STATUS."
           if [ "$pct" -ge "$WARN" ]; then
             msg="$LABEL used $mins of $LIMIT minutes ($pct%). Raise $INPUT or split the job."
+            if [ "$pct" -ge 100 ] && [ "$STATUS" = cancelled ]; then
+              msg="$LABEL hit its $LIMIT-minute timeout and was cancelled. Raise $INPUT or split the job."
+            fi
             echo "::warning title=Near the job timeout::$msg"
             echo "**Near the job timeout:** $msg" >> "$GITHUB_STEP_SUMMARY"
           fi
