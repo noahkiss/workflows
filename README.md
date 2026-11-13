@@ -740,6 +740,7 @@ which a public repository runs free and a private one pays 10x for.
 | `xcode-app` | no | `''` → the image default | Xcode by path, e.g. `/Applications/Xcode_27.1.app`. The job fails, listing the installed ones, when it is missing. Set through `DEVELOPER_DIR`, no `sudo` |
 | `working-directory` | no | `.` | Folder the paths and commands below are relative to |
 | `swift-test-dirs` | no | `''` | Swift package folders to run `swift test` in, one per line, in order. Runs first |
+| `swift-resolved-only` | no | `false` | Resolve and test each `swift-test-dirs` package with only the versions in its `Package.resolved` (`--only-use-versions-from-resolved-file`). The job fails, naming the file, when it does not match `Package.swift` or when SwiftPM rewrites it. Without it, `swift test` floats the graph and rewrites the file in silence |
 | `generate` | no | `''` | Command that makes the project, e.g. `xcodegen generate` or `scripts/generate.sh` |
 | `project` | no | `''` | `.xcodeproj` or `.xcworkspace` for project lines; empty lets xcodebuild find it |
 | `builds` | no | `''` | One build per line: `scheme \| destination`, or `scheme \| destination \| package folder` to build a Swift package's scheme in that folder |
