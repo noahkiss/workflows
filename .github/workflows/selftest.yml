@@ -132,6 +132,7 @@ jobs:
       xcode-app: /Applications/Xcode.app
       working-directory: selftest/xcode
       swift-test-dirs: Kit
+      swift-resolved-only: true
       generate: ./generate.sh
       project: Selftest.xcodeproj
       builds: |

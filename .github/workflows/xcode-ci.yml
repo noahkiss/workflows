@@ -48,6 +48,15 @@ on:
         required: false
         type: string
         default: ''
+      swift-resolved-only:
+        description: >-
+          Resolve and test each swift-test-dirs package with only the versions
+          in its Package.resolved. The job fails when that file does not match
+          Package.swift, or when SwiftPM changes it, instead of floating the
+          graph and rewriting the file.
+        required: false
+        type: boolean
+        default: false
       builds:
         description: >-
           One build per line: `scheme | destination`, or
@@ -210,16 +219,39 @@ jobs:
         if: inputs.swift-test-dirs != ''
         env:
           DIRS: ${{ inputs.swift-test-dirs }}
+          RESOLVED_ONLY: ${{ inputs.swift-resolved-only }}
+          WD: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
+          # The annotations want a path from the repository root.
+          root=""
+          [ "${WD%/}" = . ] || root="${WD%/}/"
+          flags=()
+          [ "$RESOLVED_ONLY" = true ] && flags=(--only-use-versions-from-resolved-file)
           while IFS= read -r dir; do
             dir="${dir%$'\r'}"
             dir="${dir#"${dir%%[![:space:]]*}"}"
             dir="${dir%"${dir##*[![:space:]]}"}"
             [ -n "$dir" ] || continue
+            if [ "$RESOLVED_ONLY" = true ]; then
+              # Resolve on its own first, so a stale file fails with a message
+              # that names it, not in the middle of a build.
+              echo "::group::swift package resolve in $dir (only Package.resolved versions)"
+              if ! ( cd "$dir" && swift package resolve "${flags[@]}" ) </dev/null; then
+                echo "::endgroup::"
+                echo "::error file=$root$dir/Package.resolved,title=Package.resolved out of date::$dir/Package.resolved does not match $dir/Package.swift. Run swift package resolve in $dir and commit Package.resolved."
+                exit 1
+              fi
+              echo "::endgroup::"
+            fi
             echo "::group::swift test in $dir"
-            ( cd "$dir" && swift test ) </dev/null
+            ( cd "$dir" && swift test ${flags[@]+"${flags[@]}"} ) </dev/null
             echo "::endgroup::"
+            if [ "$RESOLVED_ONLY" = true ] && ! git diff --quiet -- "$dir/Package.resolved"; then
+              git --no-pager diff -- "$dir/Package.resolved"
+              echo "::error file=$root$dir/Package.resolved,title=Package.resolved changed::SwiftPM rewrote $dir/Package.resolved. Run swift package resolve in $dir and commit Package.resolved."
+              exit 1
+            fi
           done <<< "$DIRS"
 
       - name: Generate the project
