@@ -16,6 +16,10 @@ updates:
       - /actions/*
     schedule:
       interval: weekly
+    # Offer a release only after it has been public for three days, the same
+    # soak the shared Renovate preset applies (minimumReleaseAge).
+    cooldown:
+      default-days: 3
     commit-message:
       prefix: actions
     groups:
