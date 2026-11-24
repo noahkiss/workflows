@@ -747,6 +747,8 @@ which a public repository runs free and a private one pays 10x for.
 | `tests` | no | `''` | One `xcodebuild test` per line, the same form. The destination `ios-simulator` picks the first iPhone, by name, of the newest iOS runtime no newer than the selected Xcode's simulator SDK |
 | `xcodebuild-args` | no | `''` | Extra arguments for every xcodebuild, one per line, e.g. `CODE_SIGNING_ALLOWED=NO` |
 | `spm-cache-key-file` | no | `''` → no cache | Glob of the `Package.resolved` file(s) the SwiftPM cache keys on, from the repository root |
+| `compilation-cache` | no | `false` | Turn on Xcode compilation caching for every xcodebuild (`COMPILATION_CACHE_ENABLE_CACHING=YES`) and keep its store between runs in the Actions cache. Off adds no step and no flag |
+| `compilation-cache-limit` | no | `''` → Xcode's default | Size limit of the store, passed as `COMPILATION_CACHE_LIMIT_SIZE`: whole bytes, or a whole number with `K`, `M`, `G` or `T`, e.g. `2G`; `0` means no limit. Any other form fails the job. Xcode's default is 50% of the free disk space, so set this |
 | `netrc` | no | `true` | Write a `~/.netrc` for `api.github.com` with the job token. Callers with SwiftPM binary targets from GitHub saw 403s from the anonymous rate limit without it. Removed at the end |
 | `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
 | `timeout-minutes` | no | `60` | Job timeout |
@@ -766,6 +768,19 @@ It saves when the key missed and the builds and tests ran, also when one
 failed; with no `builds` or `tests`, only when the job succeeded. It never
 saves after an earlier step failed (the packages folder may be empty, and an
 exact-key entry is not saved again), and never from a tag.
+
+With `compilation-cache`, every xcodebuild also gets
+`COMPILATION_CACHE_ENABLE_CACHING=YES` and
+`COMPILATION_CACHE_CAS_PATH=<runner temp>/xcode-ci-cas`, after the
+`xcodebuild-args`. The store's key carries the runner OS and arch, the Xcode
+build version, the hash of `spm-cache-key-file` (when set) and the run id and
+attempt. A restore takes the newest store with the same hash, else the newest
+with the same Xcode. The save follows the SwiftPM rules, except that every run
+saves a new entry, and an empty store is not saved. Each entry is a full copy
+of the store, and the repository's Actions cache quota evicts the oldest
+entries first, which can include the SwiftPM entry and the caller's other
+caches. Keep the store small with `compilation-cache-limit`. The limit format
+comes from the open-source swift-build (`CASOptions.parseSizeLimit`).
 The job's concurrency group is
 `xcode-ci-<repo>-<calling workflow>-<working-directory>-<ref>`.
 

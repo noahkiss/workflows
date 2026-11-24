@@ -122,7 +122,8 @@ jobs:
         go test ./...
 
   # Every xcode-ci input on the fixture app: swift test, XcodeGen, an iOS
-  # Simulator and a macOS build, the package's tests on a simulator, the cache.
+  # Simulator and a macOS build, the package's tests on a simulator, the
+  # SwiftPM and compilation caches.
   xcode:
     permissions:
       contents: read
@@ -141,6 +142,8 @@ jobs:
       tests: |
         Kit | ios-simulator | Kit
       spm-cache-key-file: selftest/xcode/Kit/Package.swift
+      compilation-cache: true
+      compilation-cache-limit: 500M
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
       timeout-minutes: 30
 
