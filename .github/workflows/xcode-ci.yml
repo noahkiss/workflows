@@ -4,7 +4,8 @@ name: Xcode CI
 # `swift test` in the given package folders, runs an optional generate command
 # (XcodeGen, say), then `xcodebuild build` and `xcodebuild test` per line of
 # `builds` and `tests`. SwiftPM checkouts and binary artifacts are cached,
-# keyed on a Package.resolved. Signed archives and uploads are not here: they
+# keyed on a Package.resolved. With compilation-cache, the Xcode compilation
+# cache store is kept between runs too. Signed archives and uploads are not here: they
 # need environment secrets, which do not reach a reusable workflow from another
 # repo, so they are the composite actions xcode-match-signing and
 # xcode-archive-upload, run as steps of the caller's own job.
@@ -85,6 +86,23 @@ on:
         description: >-
           Glob of the Package.resolved file(s) the SwiftPM cache is keyed on,
           relative to the repository root. Empty turns the cache off.
+        required: false
+        type: string
+        default: ''
+      compilation-cache:
+        description: >-
+          Turn on Xcode compilation caching for every xcodebuild and keep its
+          store between runs in the Actions cache. Each run restores the newest
+          store and saves a new one, so set compilation-cache-limit.
+        required: false
+        type: boolean
+        default: false
+      compilation-cache-limit:
+        description: >-
+          Size limit of the compilation cache store, passed as
+          COMPILATION_CACHE_LIMIT_SIZE: a whole number of bytes, or one with
+          the suffix K, M, G or T, e.g. 2G. 0 means no limit. Empty leaves
+          Xcode's default, 50% of the free disk space.
         required: false
         type: string
         default: ''
@@ -202,6 +220,45 @@ jobs:
           echo "prefix=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-" >> "$GITHUB_OUTPUT"
           echo "key=xcode-ci-spm-$RUNNER_OS-$RUNNER_ARCH-$xcode-$HASH" >> "$GITHUB_OUTPUT"
 
+      # Every run saves a new store under its own key (the run id and
+      # attempt), so the store keeps what each run compiled. A restore takes
+      # the newest store for the same Package.resolved, else the newest for
+      # the same Xcode.
+      - name: Compilation cache key
+        id: cas-key
+        if: inputs.compilation-cache && (inputs.builds != '' || inputs.tests != '')
+        env:
+          HASH: ${{ inputs.spm-cache-key-file != '' && hashFiles(inputs.spm-cache-key-file) || '' }}
+          LIMIT: ${{ inputs.compilation-cache-limit }}
+        run: |
+          set -euo pipefail
+          if [ -n "$LIMIT" ] && ! [[ "$LIMIT" =~ ^[0-9]+[KMGT]?$ ]]; then
+            echo "::error::compilation-cache-limit '$LIMIT' is not a whole number with an optional K, M, G or T, e.g. 2G"
+            exit 1
+          fi
+          xcode=$(xcodebuild -version | sed -n 's/^Build version //p')
+          [ -n "$xcode" ] || { echo "::error::cannot read the Xcode build version"; exit 1; }
+          base="xcode-ci-cas-$RUNNER_OS-$RUNNER_ARCH-$xcode-"
+          prefix="$base"
+          [ -z "$HASH" ] || prefix="$base$HASH-"
+          {
+            echo "key=$prefix$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "restore-keys<<EOF"
+            echo "$prefix"
+            [ "$prefix" = "$base" ] || echo "$base"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "XCODE_CI_CAS=$RUNNER_TEMP/xcode-ci-cas" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/xcode-ci-cas"
+
+      - name: Restore the compilation cache
+        if: steps.cas-key.outputs.key != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/xcode-ci-cas
+          key: ${{ steps.cas-key.outputs.key }}
+          restore-keys: ${{ steps.cas-key.outputs.restore-keys }}
+
       # The shared SwiftPM cache serves `swift test`; the cloned packages
       # folder serves xcodebuild (-clonedSourcePackagesDirPath).
       - name: Restore the SwiftPM cache
@@ -270,6 +327,8 @@ jobs:
           TESTS: ${{ inputs.tests }}
           PROJECT: ${{ inputs.project }}
           EXTRA_ARGS: ${{ inputs.xcodebuild-args }}
+          CAS: ${{ steps.cas-key.outputs.key != '' }}
+          CAS_LIMIT: ${{ inputs.compilation-cache-limit }}
         run: |
           set -euo pipefail
           trim() { local s="$1"; s="${s%$'\r'}"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
@@ -279,6 +338,11 @@ jobs:
             arg=$(trim "$arg")
             [ -n "$arg" ] && extra+=("$arg")
           done <<< "$EXTRA_ARGS"
+          # After the caller's arguments, so the store used is the one cached.
+          if [ "$CAS" = true ]; then
+            extra+=(COMPILATION_CACHE_ENABLE_CACHING=YES "COMPILATION_CACHE_CAS_PATH=$XCODE_CI_CAS")
+            [ -z "$CAS_LIMIT" ] || extra+=("COMPILATION_CACHE_LIMIT_SIZE=$CAS_LIMIT")
+          fi
 
           project=()
           case "$PROJECT" in
@@ -376,6 +440,32 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ${{ runner.temp }}/xcode-ci-packages
           key: ${{ steps.spm-key.outputs.key }}
+
+      # The same conditions as the SwiftPM cache, without the key miss: each
+      # run has its own key. An empty store (no build got to compile) is not
+      # saved, so it never becomes the newest entry.
+      - name: Measure the compilation cache
+        id: cas-size
+        if: >-
+          !cancelled() && steps.cas-key.outputs.key != ''
+          && !startsWith(github.ref, 'refs/tags/')
+          && (steps.builds.outcome == 'success' || steps.builds.outcome == 'failure')
+        run: |
+          set -euo pipefail
+          if [ -n "$(find "$XCODE_CI_CAS" -type f -print -quit)" ]; then
+            echo "Compilation cache store: $(du -sh "$XCODE_CI_CAS" | cut -f1)"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The compilation cache store is empty; not saved."
+          fi
+
+      - name: Save the compilation cache
+        if: >-
+          !cancelled() && steps.cas-size.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/xcode-ci-cas
+          key: ${{ steps.cas-key.outputs.key }}
 
       - name: Remove ~/.netrc
         if: always() && inputs.netrc
