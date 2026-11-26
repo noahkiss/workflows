@@ -106,6 +106,22 @@ on:
         required: false
         type: string
         default: ''
+      compilation-cache-key-suffix:
+        description: >-
+          Name of this job's compilation cache store, e.g. ios or mac, so
+          several calls in one run save separate stores instead of one key,
+          and each restores its own. Empty keeps one store per run.
+        required: false
+        type: string
+        default: ''
+      spm-cache-save:
+        description: >-
+          Save the SwiftPM cache on a key miss. Pass false in a call that runs
+          only swift-test-dirs beside calls that build: its entry would lack
+          the cloned packages folder the builds use, and the first save wins.
+        required: false
+        type: boolean
+        default: true
       netrc:
         description: >-
           Write a ~/.netrc for api.github.com with the job token. Callers with
@@ -140,6 +156,14 @@ on:
         required: false
         type: boolean
         default: true
+      concurrency-key:
+        description: >-
+          Extra text for the job's concurrency group, so several calls of
+          xcode-ci in one run (an iOS and a macOS build, say) do not cancel or
+          queue behind each other.
+        required: false
+        type: string
+        default: ''
 
 jobs:
   ci:
@@ -149,7 +173,7 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: xcode-ci-${{ github.repository }}-${{ github.workflow }}-${{ inputs.working-directory }}-${{ github.ref }}
+      group: xcode-ci-${{ github.repository }}-${{ github.workflow }}-${{ inputs.working-directory }}-${{ github.ref }}${{ inputs.concurrency-key != '' && format('-{0}', inputs.concurrency-key) || '' }}
       cancel-in-progress: ${{ inputs.cancel-in-progress }}
     defaults:
       run:
@@ -223,22 +247,30 @@ jobs:
       # Every run saves a new store under its own key (the run id and
       # attempt), so the store keeps what each run compiled. A restore takes
       # the newest store for the same Package.resolved, else the newest for
-      # the same Xcode.
+      # the same Xcode. compilation-cache-key-suffix puts a name after the
+      # Xcode build version, so each named store restores only its own
+      # entries and two calls in one run never share a key.
       - name: Compilation cache key
         id: cas-key
         if: inputs.compilation-cache && (inputs.builds != '' || inputs.tests != '')
         env:
           HASH: ${{ inputs.spm-cache-key-file != '' && hashFiles(inputs.spm-cache-key-file) || '' }}
           LIMIT: ${{ inputs.compilation-cache-limit }}
+          SUFFIX: ${{ inputs.compilation-cache-key-suffix }}
         run: |
           set -euo pipefail
           if [ -n "$LIMIT" ] && ! [[ "$LIMIT" =~ ^[0-9]+[KMGT]?$ ]]; then
             echo "::error::compilation-cache-limit '$LIMIT' is not a whole number with an optional K, M, G or T, e.g. 2G"
             exit 1
           fi
+          if [ -n "$SUFFIX" ] && ! [[ "$SUFFIX" =~ ^[A-Za-z0-9._]+$ ]]; then
+            echo "::error::compilation-cache-key-suffix '$SUFFIX' may hold only letters, digits, dots and underscores"
+            exit 1
+          fi
           xcode=$(xcodebuild -version | sed -n 's/^Build version //p')
           [ -n "$xcode" ] || { echo "::error::cannot read the Xcode build version"; exit 1; }
           base="xcode-ci-cas-$RUNNER_OS-$RUNNER_ARCH-$xcode-"
+          [ -z "$SUFFIX" ] || base="$base$SUFFIX-"
           prefix="$base"
           [ -z "$HASH" ] || prefix="$base$HASH-"
           {
@@ -424,12 +456,13 @@ jobs:
 
       # Saved when the builds and tests ran, even when one failed, so the
       # checkouts are not lost to a failing test; with no builds or tests, only
-      # on success. Not after an earlier failure: the packages folder may be
-      # empty, and an exact-key entry is never saved again. Never from a tag:
-      # a tag's cache is visible to that tag only.
+      # on success; never with spm-cache-save false. Not after an earlier
+      # failure: the packages folder may be empty, and an exact-key entry is
+      # never saved again. Never from a tag: a tag's cache is visible to that
+      # tag only.
       - name: Save the SwiftPM cache
         if: >-
-          !cancelled() && steps.spm-key.outputs.key != ''
+          !cancelled() && inputs.spm-cache-save && steps.spm-key.outputs.key != ''
           && steps.spm-cache.outputs.cache-hit != 'true'
           && !startsWith(github.ref, 'refs/tags/')
           && (steps.builds.outcome == 'success' || steps.builds.outcome == 'failure'
