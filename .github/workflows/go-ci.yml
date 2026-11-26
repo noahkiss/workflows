@@ -103,7 +103,7 @@ on:
           entry keyed on go.sum, and the build cache an entry per name, so
           each shard, race build or tag set keeps the objects it compiled.
           Every run restores the newest entry for its name; only the default
-          branch saves, a new entry each run, after deleting build cache files
+          branch saves, a new entry each run whose commands passed, after deleting build cache files
           unused for 90 minutes. Empty keeps setup-go's cache.
         required: false
         type: string
@@ -244,6 +244,7 @@ jobs:
           fi
 
       - name: Run commands
+        id: commands
         env:
           COMMANDS: ${{ inputs.commands }}
         run: |
@@ -292,15 +293,19 @@ jobs:
           path: ${{ inputs.working-directory }}/${{ inputs.cache-path }}
           key: ${{ inputs.cache-key }}
 
-      # The per-job Go caches save from the default branch only, even when a
-      # command failed. Go refreshes a build cache file's time when it uses a
-      # file last touched over an hour ago, so a file untouched for 90 minutes
-      # was not used by this job: it is deleted, and the entry holds only what
-      # this job needs. The module cache saves when its key missed.
+      # The per-job Go caches save from the default branch only, and the build
+      # cache only when the commands passed. Go refreshes a build cache file's
+      # time when it uses a file last touched over an hour ago, so a file
+      # untouched for 90 minutes was not used by this job: it is deleted, and
+      # the entry holds only what this job needs. After a failed or skipped
+      # command most files were never used, so the pruned entry would be
+      # nearly empty and would become the newest: no save then. The module
+      # cache saves when its key missed.
       - name: Prune the Go build cache
         id: go-cache-prune
         if: >-
           !cancelled() && inputs.build-cache-key != ''
+          && steps.commands.outcome == 'success'
           && github.ref == format('refs/heads/{0}', github.event.repository.default_branch || 'main')
         env:
           GOCACHE_DIR: ${{ steps.go-cache.outputs.gocache }}

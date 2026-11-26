@@ -658,9 +658,11 @@ cache is off and the job keeps two caches of its own:
 - **Build cache:** key `go-ci-build-<os>-<arch>-<go version>-<name>-<go.sum hash>-<run id>-<attempt>`.
   A restore takes the newest entry with the same name and `go.sum`, else the
   newest with the same name. Only the default branch saves, a new entry each
-  run, also when a command failed. Before the save it deletes the build cache
+  run in which the commands passed. Before the save it deletes the build cache
   files untouched for 90 minutes. Go refreshes a file's time when it uses one
   last touched over an hour ago, so those files were not used by this job.
+  After a failed command most files may be unused, and the pruned entry would
+  be nearly empty, so a failed run saves nothing.
 - **Module cache:** key `go-ci-mod-<os>-<arch>-<go.sum hash>`. On a miss on the
   default branch the job runs `go mod download`, then saves, so the entry holds
   every module whichever job saves first.
