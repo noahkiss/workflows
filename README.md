@@ -633,6 +633,7 @@ The shared Go gate: Go from the module's version file, an optional `gofmt` and
 | `cache-key` | no | `''` | Key for `cache-path`. Restored on every run; saved after the commands on the default branch only, when the key missed, even if a command failed |
 | `cancel-in-progress` | no | `true` | Whether a newer run of the same workflow on the same ref cancels this job. Pass `${{ github.ref != 'refs/heads/main' }}` to keep main runs |
 | `concurrency-key` | no | `''` | Extra text for the concurrency group, so several calls in one run (a matrix of test shards) do not cancel or queue behind each other. Pass e.g. `${{ matrix.shard }}` |
+| `build-cache-key` | no | `''` → setup-go's cache | A name for this job's own Go build cache, e.g. the shard. Replaces setup-go's one shared cache with a module cache entry keyed on `go.sum` and a build cache entry per name. Saved from the default branch only (below) |
 
 Secrets: none.
 
@@ -649,7 +650,25 @@ permissions:
   contents: read
 ```
 
-`setup-go` caches the module and build caches, keyed on `go.sum`.
+`setup-go` caches the module and build caches, keyed on `go.sum`. That is one
+entry for every job, saved by whichever job misses first, so a matrix of shards
+or a race build mostly compiles from scratch. With `build-cache-key`, setup-go's
+cache is off and the job keeps two caches of its own:
+
+- **Build cache:** key `go-ci-build-<os>-<arch>-<go version>-<name>-<go.sum hash>-<run id>-<attempt>`.
+  A restore takes the newest entry with the same name and `go.sum`, else the
+  newest with the same name. Only the default branch saves, a new entry each
+  run, also when a command failed. Before the save it deletes the build cache
+  files untouched for 90 minutes. Go refreshes a file's time when it uses one
+  last touched over an hour ago, so those files were not used by this job.
+- **Module cache:** key `go-ci-mod-<os>-<arch>-<go.sum hash>`. On a miss on the
+  default branch the job runs `go mod download`, then saves, so the entry holds
+  every module whichever job saves first.
+
+Every default-branch run adds one build cache entry per name. GitHub evicts the
+oldest entries above the repository's 10 GB, so callers with large caches of
+other kinds should watch the total.
+
 `generate-check` catches a schema or source change committed without its
 regenerated code.
 
@@ -749,6 +768,8 @@ which a public repository runs free and a private one pays 10x for.
 | `spm-cache-key-file` | no | `''` → no cache | Glob of the `Package.resolved` file(s) the SwiftPM cache keys on, from the repository root |
 | `compilation-cache` | no | `false` | Turn on Xcode compilation caching for every xcodebuild (`COMPILATION_CACHE_ENABLE_CACHING=YES`) and keep its store between runs in the Actions cache. Off adds no step and no flag |
 | `compilation-cache-limit` | no | `''` → Xcode's default | Size limit of the store, passed as `COMPILATION_CACHE_LIMIT_SIZE`: whole bytes, or a whole number with `K`, `M`, `G` or `T`, e.g. `2G`; `0` means no limit. Any other form fails the job. Xcode's default is 50% of the free disk space, so set this |
+| `compilation-cache-key-suffix` | no | `''` | A name for this call's compilation cache store, e.g. `ios`. Several calls in one run then save separate entries, and each restores only its own. Letters, digits, dots and underscores |
+| `spm-cache-save` | no | `true` | Save the SwiftPM cache on a key miss. Pass `false` in a call that runs only `swift-test-dirs` beside calls that build: its entry would lack the cloned packages folder, and the first save of a key wins |
 | `netrc` | no | `true` | Write a `~/.netrc` for `api.github.com` with the job token. Callers with SwiftPM binary targets from GitHub saw 403s from the anonymous rate limit without it. Removed at the end |
 | `logs-name` | no | `xcode-ci-logs` | Artifact name for the full logs, uploaded on failure. Give each call its own when one run calls this twice |
 | `timeout-minutes` | no | `60` | Job timeout |
@@ -781,8 +802,14 @@ of the store, and the repository's Actions cache quota evicts the oldest
 entries first, which can include the SwiftPM entry and the caller's other
 caches. Keep the store small with `compilation-cache-limit`. The limit format
 comes from the open-source swift-build (`CASOptions.parseSizeLimit`).
+With `compilation-cache-key-suffix`, the name follows the Xcode build version
+in the key, so a restore never takes another call's store.
 The job's concurrency group is
-`xcode-ci-<repo>-<calling workflow>-<working-directory>-<ref>`.
+`xcode-ci-<repo>-<calling workflow>-<working-directory>-<ref>`, then
+`-<concurrency-key>` when set. A caller that splits its Apple work into several
+calls in one run (Swift tests, an iOS build, a macOS build) gives each call its
+own `concurrency-key`, `compilation-cache-key-suffix` and `logs-name`, and
+passes `spm-cache-save: false` to the call that only runs `swift test`.
 
 Permissions the calling job must grant:
 

@@ -89,6 +89,7 @@ jobs:
 
   # Two calls in one run on the same runner and ref, as a matrix of shards: with
   # concurrency-key they share no group, so neither is cancelled and both finish.
+  # build-cache-key gives each its own build cache entry, saved on main.
   go-shards:
     strategy:
       matrix:
@@ -99,6 +100,7 @@ jobs:
     with:
       working-directory: selftest/go
       concurrency-key: ${{ matrix.shard }}
+      build-cache-key: selftest-${{ matrix.shard }}
 
   # Every newer input at once, on macOS. Its runner differs from the job above,
   # so the two share no concurrency group and both finish. timeout-warn-percent 1
@@ -144,8 +146,30 @@ jobs:
       spm-cache-key-file: selftest/xcode/Kit/Package.swift
       compilation-cache: true
       compilation-cache-limit: 500M
+      compilation-cache-key-suffix: full
+      concurrency-key: full
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
       timeout-minutes: 30
+
+  # A second call in the same run, as a caller that splits its Apple jobs does:
+  # its own concurrency-key keeps both calls running, and with spm-cache-save
+  # off it never saves a SwiftPM entry without the cloned packages.
+  xcode-swift:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/xcode-ci.yml
+    with:
+      runner: macos-26
+      xcode-app: /Applications/Xcode.app
+      working-directory: selftest/xcode
+      swift-test-dirs: Kit
+      swift-resolved-only: true
+      spm-cache-key-file: selftest/xcode/Kit/Package.swift
+      spm-cache-save: false
+      logs-name: xcode-ci-logs-swift
+      concurrency-key: swift
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      timeout-minutes: 20
 
   # The release actions without Apple credentials: fastlane is a stand-in,
   # so the run checks the match flags, the keychain, the xcconfig, the
